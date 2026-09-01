@@ -1,0 +1,40 @@
+# NeuG Memory Benchmark — 统一 harness 配置模板
+# 复制为 config.yaml 并填入真实 key（config.yaml 已 gitignore，勿提交）
+
+llm:
+  # DashScope OpenAI 兼容端点（协议见 benchmark-plan.md 3.1）
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key: ${DASHSCOPE_API_KEY}   # 从环境变量注入，勿硬编码
+  answer_model: qwen-plus         # 答题模型（版本 pin 死后更新此处）
+  judge_model: qwen-max           # 判分模型
+  temperature: 0.0
+
+eval:
+  qa_file: data/processed/qa_eval.jsonl      # cat1-4 共 1540 题
+  sessions_file: data/processed/sessions.jsonl
+  runs: 3                                     # 每配置轮数
+  categories: [1, 2, 3, 4]
+
+systems:
+  # 各臂工作目录与启动方式（adapter 就绪后逐个启用）
+  graphiti:
+    repo: ~/Documents/projects/graphiti
+    backends: [neo4j, falkordb, kuzu, neug]  # neug 臂依赖 WS0 driver
+  mem0:
+    repo: ~/Documents/projects/mem0          # fork, branch: feature/neug-vector-store
+    backends: [qdrant, neug]
+  cognee:
+    repo: ~/Documents/projects/cognee        # fork, branch: feature/neug-graph-adapter
+    backends: [default, neug]
+  openviking:
+    mode: blackbox                           # pip install openviking, SDK 可编程
+  graphify:
+    repo: ~/Documents/projects/graphify      # with-neug 在 PR #2895 分支
+  codegraph:
+    repo: ~/Documents/projects/codegraph     # with-neug 在 PR #698 分支；LoCoMo 不适用
+
+performance:
+  dataset_1: LongMemEval-M                   # A 类：agent 对话记忆数据（待下载）
+  dataset_2_repo: null                       # B 类：代码仓库选型后冻结
+  query_classes: [vector_topk, fts_keyword, hybrid, graph_multihop]
+  recall_threshold: 0.95

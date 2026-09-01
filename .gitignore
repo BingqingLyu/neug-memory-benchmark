@@ -1,0 +1,16 @@
+.venv/
+neug-build-312/
+harness/config.yaml
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.ruff_cache/
+
+# 数据集与实验产物（体积大，本地生成；见 README 复现步骤）
+data/
+results/
+
+# 环境探针/冒烟脚本（临时验证用，非交付实现）
+probes/
+test.py

@@ -8,22 +8,33 @@
   over-fetch）+ keyword_search BM25 + sigmoid 归一 + score_and_rank 加性融合，
   即 Memory.search 的检索主体；查询 embedding 步骤换成数据集预计算向量，
   entity boost 通道在直注模式下结构性为空（实体库无写入）。
-- graph_multihop：mem0 v2 OSS 检索路径无图遍历 → N/A（契约 §3.5）。
+- graph_multihop：qdrant 臂无图遍历能力 → N/A（契约 §3.5）；NeuG 臂经 neug
+  vector store 的原生关系表（mem0_mem0_links）承载规范共现图，query 走变长
+  Cypher BFS（*1..2），与 graphiti-neug 同口径——见 Mem0NeuGPerfAdapter。
 - 关遥测（MEM0_TELEMETRY=False）：避免 NeuG 同进程重复开同一 DB（Error 1004）。
 
 实现说明详见 results/perf/<arm>/NOTES.md。
 """
+import csv  # noqa: E402
 import os
+import time  # noqa: E402
 
 os.environ.setdefault("MEM0_TELEMETRY", "False")  # 必须在 import mem0 前
 
 import shutil  # noqa: E402
 import uuid  # noqa: E402
 
+import numpy as np  # noqa: E402
 from mem0 import Memory  # noqa: E402
 from mem0.utils.lemmatization import lemmatize_for_bm25  # noqa: E402
 
-from ..base import FTS_KEYWORD, HYBRID, PerfAdapter, VECTOR_TOPK  # noqa: E402
+from ..base import (  # noqa: E402
+    FTS_KEYWORD,
+    GRAPH_MULTIHOP,
+    HYBRID,
+    PerfAdapter,
+    VECTOR_TOPK,
+)
 
 EMBED_DIMS = 1024
 USER_ID = "perf-corpus"      # 隔离键：写入/查询统一按该 user_id 过滤
@@ -49,14 +60,19 @@ class _InjectedEmbedder:
 
 
 class Mem0PerfAdapter(PerfAdapter):
-    #: mem0 v2 OSS 检索路径无图遍历 → graph_multihop 由 runner 标 N/A
+    #: 基类=qdrant 臂口径：无图遍历 → graph_multihop N/A。NeuG 臂在子类里
+    #: 覆盖 supported_classes 补上 GRAPH_MULTIHOP（neug store 有原生关系表）。
     supported_classes = frozenset({VECTOR_TOPK, FTS_KEYWORD, HYBRID})
 
     def __init__(self):
         self.memory = None
         self._embedder = _InjectedEmbedder()
         self._id2sid = {}                          # 后端主键 -> session_id
+        self._sid2mid = {}                         # session_id -> 后端主键（建边/BFS 用）
         self._filters = {"user_id": USER_ID}
+        self._work_dir = None
+        # graph 邻域缓存：warmup 与计时重放同一种子，病态高度数种子只算一次
+        self._graph_cache = {}
 
     def _vector_store_config(self, work_dir):
         raise NotImplementedError
@@ -66,6 +82,7 @@ class Mem0PerfAdapter(PerfAdapter):
 
     # ---- 生命周期 ----
     def setup(self, work_dir):
+        self._work_dir = work_dir
         # 清理上次运行的后端数据，保证每次 load 从空库开始（幂等）
         for path in self._backend_dirs(work_dir) + [os.path.join(work_dir, "history.db")]:
             if os.path.isdir(path):
@@ -114,6 +131,7 @@ class Mem0PerfAdapter(PerfAdapter):
                 mid = str(uuid.uuid4())
                 ids.append(mid)
                 self._id2sid[mid] = corpus.session_ids[i]
+                self._sid2mid[corpus.session_ids[i]] = mid
                 payloads.append({
                     # data 原文即 FTS 索引字段（NeuG text 列 / qdrant bm25 稀疏向量）
                     "data": corpus.texts[i],
@@ -168,6 +186,10 @@ class Mem0PerfAdapter(PerfAdapter):
 
 class Mem0NeuGPerfAdapter(Mem0PerfAdapter):
     name = "mem0-neug"
+    #: NeuG 臂补上 graph_multihop：neug vector store 有原生关系表 + 变长 BFS。
+    #: qdrant 臂无此能力，保持基类的 N/A（能力完整性矩阵，与 semantica 对称：
+    #: 原生栈缺的能力由 NeuG 后端补齐）。
+    supported_classes = frozenset({VECTOR_TOPK, FTS_KEYWORD, HYBRID, GRAPH_MULTIHOP})
 
     def _vector_store_config(self, work_dir):
         return {"provider": "neug", "config": {
@@ -179,6 +201,71 @@ class Mem0NeuGPerfAdapter(Mem0PerfAdapter):
 
     def _backend_dirs(self, work_dir):
         return [os.path.join(work_dir, "neug.db")]
+
+    # ---- load：节点直注后，把规范共现图批量 COPY 进 neug 关系表 ----
+    def load(self, corpus):
+        super().load(corpus)
+        self._load_graph_edges(corpus)
+
+    def _load_graph_edges(self, corpus):
+        """2.8M 无向共现边按双向各写一条 COPY 进 mem0_mem0_links 关系表。
+
+        不用 neug.add_edge（每条边 2 次 MATCH，2.8M 边不可行）；走 COPY 批量导入
+        （与 graphiti-neug 的 RELATES_TO COPY 同路径，探针 probe_mem0_graph.py
+        已验证 COPY 进 REL 表 + 变长 BFS 正确）。双向写是为了用有向变长模式
+        `*1..2 ->` 覆盖无向 2 跳邻域（graphiti-neug 同款做法）。
+        """
+        store = self.memory.vector_store
+        ids = np.asarray(corpus.session_ids)
+        src = ids[corpus.graph_edges[:, 0]]
+        dst = ids[corpus.graph_edges[:, 1]]
+        sid2mid = self._sid2mid
+        csv_dir = os.path.join(self._work_dir, "csv")
+        os.makedirs(csv_dir, exist_ok=True)
+        path = os.path.join(csv_dir, "graph_edges.csv")
+        t0 = time.time()
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["from", "to", "relation", "weight"])
+            for a, b in zip(src, dst):
+                ma, mb = sid2mid[str(a)], sid2mid[str(b)]
+                w.writerow([ma, mb, "co_occurs", 1.0])
+                w.writerow([mb, ma, "co_occurs", 1.0])
+        print(f"[{self.name}] edge csv written ({len(src) * 2} rows) "
+              f"in {time.time() - t0:.0f}s, COPY ...", flush=True)
+        store._execute(
+            f'COPY {store._edge_table} FROM "{path}" (HEADER true, DELIMITER ",")'
+        )
+        print(f"[{self.name}] graph edges COPY done in {time.time() - t0:.0f}s",
+              flush=True)
+
+    def query_graph(self, seed_session_id, max_nodes):
+        """变长 Cypher BFS（*1..2）返回完整 2 跳邻域的 session_id 集合。
+
+        契约 §6：真实臂返回完整邻域即 ⊇ GT（GT 已按 hop 独立截断到
+        hop1≤50 + hop2≤100），故 max_nodes 形参此处不适用、不做全局截断。
+        只 RETURN DISTINCT n.id（不序列化 payload），与 graphiti-neug 的
+        driver 级 BFS 同口径；绕开 neug.traverse 的逐节点单跳迭代（高度数
+        种子会退化成上千次查询）。双向边会让种子自身经回流边出现在结果里，
+        属超集，对 recall_full 无害。
+        """
+        cached = self._graph_cache.get(seed_session_id)
+        if cached is not None:
+            return cached
+        store = self.memory.vector_store
+        mid = self._sid2mid.get(seed_session_id)
+        if mid is None:
+            self._graph_cache[seed_session_id] = []
+            return []
+        rows = store._execute(
+            f"MATCH (origin:{store.table_name} {{id: $src}})"
+            f"-[:{store._edge_table}*1..2]->(n:{store.table_name}) "
+            f"RETURN DISTINCT n.id AS id",
+            {"src": mid},
+        )
+        sids = [self._id2sid[r["id"]] for r in rows if r["id"] in self._id2sid]
+        self._graph_cache[seed_session_id] = sids
+        return sids
 
 
 class Mem0QdrantPerfAdapter(Mem0PerfAdapter):

@@ -276,7 +276,7 @@ class GraphitiNeuGPerfAdapter(GraphitiPerfAdapter):
         print(f"[{self.name}] entity csv written in {time.time() - t0:.0f}s, "
               f"COPY ...", flush=True)
         await self._driver.execute_query(
-            f'COPY Entity FROM "{path}" (HEADER true, DELIMITER ",")'
+            f'COPY Entity FROM "{path}" (HEADER=true, DELIMITER=",", ESCAPE="")'
         )
 
     async def _load_edges(self, corpus):
@@ -300,7 +300,7 @@ class GraphitiNeuGPerfAdapter(GraphitiPerfAdapter):
             print(f"[{self.name}] edge csv written ({len(src) * 2} rows) "
                   f"in {time.time() - t0:.0f}s, COPY ...", flush=True)
         await self._driver.execute_query(
-            f'COPY RELATES_TO FROM "{path}" (HEADER true, DELIMITER ",")'
+            f'COPY RELATES_TO FROM "{path}" (HEADER=true, DELIMITER=",", ESCAPE="")'
         )
 
 

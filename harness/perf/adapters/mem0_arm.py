@@ -202,9 +202,30 @@ class Mem0NeuGPerfAdapter(Mem0PerfAdapter):
     def _backend_dirs(self, work_dir):
         return [os.path.join(work_dir, "neug.db")]
 
-    # ---- load：节点直注后，把规范共现图批量 COPY 进 neug 关系表 ----
+    # ---- load：节点走 COPY 批量直注（JSONL），再把共现图 COPY 进关系表 ----
     def load(self, corpus):
-        super().load(corpus)
+        # 覆写基类的 store.insert（多行 CREATE）为单次 COPY 批量载入：
+        # COPY 免除逐行 parse/plan/commit，JSONL 又绕开 CSV 反斜杠转义 bug。
+        # 表是 index-first（create_col 建表即建 HNSW+FTS），COPY 进已索引表
+        # 与 semantica-neug 同路径。id↔session_id 映射与基类逐条一致。
+        store = self.memory.vector_store
+        n = len(corpus.session_ids)
+        ids, payloads = [], []
+        for i in range(n):
+            mid = str(uuid.uuid4())
+            ids.append(mid)
+            self._id2sid[mid] = corpus.session_ids[i]
+            self._sid2mid[corpus.session_ids[i]] = mid
+            payloads.append({
+                "data": corpus.texts[i],
+                "user_id": USER_ID,
+                "session_id": corpus.session_ids[i],
+            })
+        t0 = time.time()
+        store.bulk_insert_copy(vectors=[list(v) for v in corpus.embeddings],
+                               payloads=payloads, ids=ids)
+        print(f"[{self.name}] nodes COPY done ({n} rows) in {time.time() - t0:.0f}s",
+              flush=True)
         self._load_graph_edges(corpus)
 
     def _load_graph_edges(self, corpus):
@@ -234,7 +255,7 @@ class Mem0NeuGPerfAdapter(Mem0PerfAdapter):
         print(f"[{self.name}] edge csv written ({len(src) * 2} rows) "
               f"in {time.time() - t0:.0f}s, COPY ...", flush=True)
         store._execute(
-            f'COPY {store._edge_table} FROM "{path}" (HEADER true, DELIMITER ",")'
+            f'COPY {store._edge_table} FROM "{path}" (HEADER=true, DELIMITER=",", ESCAPE="")'
         )
         print(f"[{self.name}] graph edges COPY done in {time.time() - t0:.0f}s",
               flush=True)

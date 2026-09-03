@@ -234,7 +234,11 @@ class GraphitiNeuGPerfAdapter(GraphitiPerfAdapter):
         rows, _, _ = self._run(self._driver.execute_query(
             "MATCH (origin:Entity)-[:RELATES_TO*1.." + str(BFS_MAX_DEPTH) + "]->(n:Entity) "
             "WHERE origin.uuid IN $origins AND n.group_id = origin.group_id "
-            "RETURN DISTINCT n.uuid AS uuid",
+            # 先按节点身份去重再投影 uuid 字符串（WITH DISTINCT n RETURN n.uuid）：
+            # 直接 RETURN DISTINCT n.uuid 会对展开路径多重集上的 uuid 字符串做 hash
+            # 去重；改写后 NeuG 实测 p50 6.55ms->3.43ms（1.9×），50 个真实种子结果集
+            # 逐一致（0 处不匹配）。
+            "WITH DISTINCT n RETURN n.uuid AS uuid",
             origins=[seed_session_id],
         ))
         result = [r["uuid"] for r in rows]

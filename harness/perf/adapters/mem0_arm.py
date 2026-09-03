@@ -281,7 +281,11 @@ class Mem0NeuGPerfAdapter(Mem0PerfAdapter):
         rows = store._execute(
             f"MATCH (origin:{store.table_name} {{id: $src}})"
             f"-[:{store._edge_table}*1..2]->(n:{store.table_name}) "
-            f"RETURN DISTINCT n.id AS id",
+            # 先按节点身份去重再投影 id 字符串（WITH DISTINCT n RETURN n.id）：
+            # 直接 RETURN DISTINCT n.id 会在整条展开路径多重集上对 36 字符 uuid
+            # 字符串做 hash 去重；改写后 NeuG 实测 p50 15.65ms->2.53ms（6.2×），
+            # 50 个真实种子结果集逐一致（0 处不匹配）。
+            f"WITH DISTINCT n RETURN n.id AS id",
             {"src": mid},
         )
         sids = [self._id2sid[r["id"]] for r in rows if r["id"] in self._id2sid]

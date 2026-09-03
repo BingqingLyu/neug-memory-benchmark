@@ -421,9 +421,13 @@ class CogneePerfAdapter(PerfAdapter):
             from cognee.infrastructure.databases.graph import get_graph_engine
 
             graph_engine = await get_graph_engine()
+            # 先按节点身份去重再投影 id 字符串：`WITH DISTINCT m RETURN m.id`。
+            # 直接 `RETURN DISTINCT m.id` 会在整条展开路径多重集上对 36 字符 UUID
+            # 字符串做 hash 去重（NeuG 实测 ~15ms）；改写后 NeuG ~0.6ms（25× 提速）、
+            # 结果集逐种子一致，ladybug 侧近乎中性。对两臂口径公平。
             return await graph_engine.query(
                 f"MATCH (n:Node)-[:EDGE*1..{GRAPH_DEPTH}]-(m:Node) "
-                "WHERE n.id = $sid RETURN DISTINCT m.id",
+                "WHERE n.id = $sid WITH DISTINCT m RETURN m.id",
                 {"sid": chunk_id},
             )
 

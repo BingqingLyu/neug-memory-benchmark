@@ -8,16 +8,21 @@
                          threshold=0.1）
 """
 import json, os, sys
+from pathlib import Path
 import numpy as np
 os.environ["MEM0_TELEMETRY"] = "False"
-sys.path.insert(0, ".")
+
+# 仓库根（本文件在 harness/perf/ 下，parents[2] 即根）：所有路径相对它派生，
+# 可用 env 覆盖，不再硬编码任何机器本地绝对路径。
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 from mem0.utils.lemmatization import lemmatize_for_bm25
 from mem0.utils.scoring import get_bm25_params, normalize_bm25, score_and_rank
 from mem0.vector_stores.neug import NeuG
 
-DATA = "./data/processed/perf"
-WORK = "./results/perf/mem0-neug/work"
+DATA = os.environ.get("BENCH_PERF_DATA", str(ROOT / "data/processed/perf"))
+WORK = os.environ.get("BENCH_MEM0_NEUG_WORK", str(ROOT / "results/perf/mem0-neug/work"))
 TOP_K, POOL, TH = 10, 50, 0.1
 
 text2sid = {}

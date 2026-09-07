@@ -44,6 +44,10 @@ LLM_MODEL = "openai/qwen-plus"
 EMBED_MODEL = "openai/text-embedding-v3"
 # cognify 切块粒度（tokens）：LoCoMo 细粒度 QA 需要比默认 ~8k 更细的块
 CHUNK_SIZE = 1024
+# 抽取冻结：固定采样参数，令两臂发出字节一致的抽取请求体（跨后端 cache 复用的前提）。
+# 注意 qwen 即便 pin 也非字节可复现，故此 pin 只统一请求体（两臂同 temperature/seed →
+# 同 sha256 cache key）；真正的抽取冻结靠代理缓存把 arm A 的响应原样回放给 arm B。
+BENCH_LLM_SEED = os.environ.get("BENCH_LLM_SEED", "1234")
 
 
 class _CogneeArm(SystemAdapter):
@@ -86,6 +90,9 @@ class _CogneeArm(SystemAdapter):
             # DashScope v3 不接受 dimensions 参数，让 litellm 丢弃它
             "LITELLM_DROP_PARAMS": "true",
             "EMBEDDING_BATCH_SIZE": "10",
+            # 抽取冻结：显式设置才会被 fold_sampling_params_into_llm_args 下发
+            "LLM_TEMPERATURE": "0",
+            "LLM_SEED": BENCH_LLM_SEED,
         }
         if self.backend == "neug":
             env.update({
@@ -112,9 +119,20 @@ class _CogneeArm(SystemAdapter):
         from cognee.modules.search.types import SearchType
 
         os.environ.update(env)
+        # cache_clear 已知配置单例，令其在 env 重注入后重读——否则 cognee 在
+        # `import cognee` 期间（load_dotenv(override=True) 已把 fork .env 的
+        # LLM_ENDPOINT=DashScope 直连灌进 os.environ）就把 get_llm_config 等
+        # lru_cache 单例定格成直连端点，导致抽取/摘要 LLM 调用**绕过缓存代理**、
+        # 每轮重新采样（qwen 不可复现）→ 抽取产物 churn，with/without 对比被污染。
+        import cognee.base_config  # noqa: F401
+        import cognee.infrastructure.databases.relational.config  # noqa: F401
+        import cognee.infrastructure.llm.config  # noqa: F401
+        import cognee.infrastructure.databases.vector.config  # noqa: F401
         for cfg_mod in (
             "cognee.base_config",
             "cognee.infrastructure.databases.relational.config",
+            "cognee.infrastructure.llm.config",
+            "cognee.infrastructure.databases.vector.config",
         ):
             mod = sys.modules.get(cfg_mod)
             if mod is None:
@@ -122,6 +140,16 @@ class _CogneeArm(SystemAdapter):
             for obj in list(vars(mod).values()):
                 if callable(getattr(obj, "cache_clear", None)):
                     obj.cache_clear()
+
+        # 回归守卫：确认 LLM 端点确实指向缓存代理，否则抽取绕过缓存、冻结失效。
+        from cognee.infrastructure.llm.config import get_llm_config
+        resolved = get_llm_config().llm_endpoint
+        if resolved.rstrip("/") != PROXY_BASE_URL.rstrip("/"):
+            raise RuntimeError(
+                f"[cognee-{self.backend}] LLM endpoint override failed: "
+                f"resolved={resolved!r} expected={PROXY_BASE_URL!r} —— 抽取会绕过"
+                f"缓存代理直连上游，冻结/复用失效，终止。"
+            )
 
         self._cognee = cognee
         self._SearchType = SearchType
@@ -145,7 +173,33 @@ class _CogneeArm(SystemAdapter):
             self._thread.join(timeout=15)
 
     async def _close_engines(self):
-        """尽力关引擎：NeuG 必须正常 close（checkpoint 纪律，约束 6）。"""
+        """尽力关引擎：NeuG 必须正常 close（checkpoint 纪律，约束 6）。
+
+        关引擎顺序有数据完整性含义，不能省。NeuG vector adapter 把写入攒在
+        进程内 _pending_rows COPY 缓冲里，只有累计到 8192 行才自动 flush，
+        低于阈值的尾部只在 adapter.close() 里做最后一次 flush。此前这里只关
+        graph 引擎就直接 shutdown 共享连接管理器，vector 缓冲里未落盘的摄入
+        尾部被静默丢弃：实测 graph 的 Node 表有全部 272 个 TextDocument、
+        478 个 chunk、478 个 summary，而 vector 的 TextDocument_name 只有
+        211、DocumentChunk_text 只有 373（丢约 22%，且集中在摄入尾部），
+        检索质量因此被系统性拉低，与后端本身无关。故先关 vector 引擎，趁
+        共享连接还活着把缓冲 flush 落盘，再关 graph 引擎，最后 shutdown
+        连接管理器。vector/graph 引擎均由 closing_lru_cache 缓存为单例，
+        这里拿到的正是摄入期缓冲数据的那个实例。
+        """
+        # (1) 先关 vector 引擎：触发其 close() 的最终 flush，落盘 COPY 缓冲尾部
+        try:
+            from cognee.infrastructure.databases.vector.get_vector_engine import (
+                get_vector_engine_async,
+            )
+
+            vengine = await get_vector_engine_async()
+            vclose = getattr(vengine, "close", None)
+            if vclose is not None:
+                await vclose()
+        except Exception as e:  # noqa: BLE001
+            print(f"[cognee-{self.backend}] vector engine close warning: {e}")
+        # (2) 再关 graph 引擎
         try:
             from cognee.infrastructure.databases.graph.get_graph_engine import get_graph_engine
 
@@ -155,6 +209,7 @@ class _CogneeArm(SystemAdapter):
                 await close()
         except Exception as e:  # noqa: BLE001
             print(f"[cognee-{self.backend}] graph engine close warning: {e}")
+        # (3) 最后关共享连接管理器
         if self.backend == "neug":
             from cognee.infrastructure.databases.neug.connection_manager import (
                 get_neug_connection_manager,

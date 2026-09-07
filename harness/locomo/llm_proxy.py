@@ -29,6 +29,21 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "..", "..",
 _lock = threading.Lock()
 _conn = None
 _stats = {"hit": 0, "miss": 0, "passthrough": 0}
+# 诊断用：设置后把每个 cacheable POST 的请求体逐行落盘，便于跨进程 diff 出
+# 非确定字段（如 litellm 注入的 litellm_call_id/metadata），定位缓存不命中的根因。
+_DUMP_BODIES = os.environ.get("BENCH_PROXY_DUMP_BODIES", "")
+
+
+def _dump_body(path: str, body: dict):
+    if not _DUMP_BODIES:
+        return
+    try:
+        import time as _t
+        with open(_DUMP_BODIES, "a") as f:
+            f.write(json.dumps({"ts": _t.time(), "path": path, "body": body},
+                               ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:  # noqa: BLE001 - 诊断落盘绝不能影响请求
+        pass
 
 
 def _db():
@@ -88,6 +103,8 @@ class Handler(BaseHTTPRequestHandler):
         if body.get("stream"):
             cacheable = False
 
+        if cacheable and self.path.rstrip("/") == "/v1/chat/completions":
+            _dump_body(self.path, body)
         key = cache_key(self.path, body) if cacheable else None
         if key:
             with _lock:

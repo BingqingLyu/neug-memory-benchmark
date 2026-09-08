@@ -42,13 +42,46 @@ import numpy as np
 from ..base import ALL_CLASSES, PerfAdapter
 
 EMBED_DIMS = 1024
-# NeuG 集合表 text/payload 列为 VARCHAR(65535)，语料最长文本 78135 字符；
-# 双臂统一截断（留 payload JSON 余量），保证 with/without 数据一致可比。
-MAX_STORED_TEXT_CHARS = 65000
-VECTOR_BATCH = 4096          # upsert_raw_vectors 分批（NeuG 侧即一批一次 COPY）
-NEUG_EDGE_BATCH = 200_000    # NeuG EDGE JSONL COPY 分批
+# NeuG 集合表 text/payload 列与图节点 properties 列均为 VARCHAR(65535 字节)；
+# 语料最长文本 78135 字符（全语料仅 1 条 >60KB）。cognee 写入前用 blob_guard
+# 按 UTF-8 字节校验 JSON blob，超限即抛错（不再静默截断损坏）。裸字符截断不足
+# 以保证：ensure_ascii 转义会把换行/引号/非 ASCII 放大（最坏 6x），且 cognee 把
+# text 连同元数据 json.dumps 成 payload blob。故按"转义后字节 + 元数据余量"
+# 自适应截断，双臂一致、可比。
+_MAX_BLOB_BYTES = 65535        # NeuG VARCHAR 字节上限
+_PAYLOAD_META_RESERVE = 1024   # payload 非文本元数据余量（实测 ~193B，留 5x 冗余）
+VECTOR_BATCH = 4096          # LanceDB 对照组分批（lance add / add_nodes），不改
+# NeuG 臂：每表压成单次 COPY。每次 COPY seal 都会全表重写 checkpoint 并重序列化
+# HNSW 索引，seal 越多累计重写量越大——实测向量分 7 次 seal 耗 ~155s（占 load 78%），
+# seal 间隔随表增大 21->33s，每次还叠加 ~15s 固定开销。单批覆盖全量 →
+# upsert_raw_vectors 单次 flush → 每表一次 COPY。48GB 内存下向量峰值 ~2-3GB，安全。
+NEUG_COPY_BATCH = 1 << 22    # 4194304 >= 语料(51661)/边(2.8M) 规模 ⇒ 单次 COPY
 LADYBUG_EDGE_SHARD = 500_000  # Ladybug EDGE CSV 分片（每片一次 COPY）
 GRAPH_DEPTH = 2              # graph_multihop GT = 2 跳邻域
+
+
+def _fit_text_to_blob(text: str) -> str:
+    """截断文本，使其 JSON 转义后字节 + 元数据余量 <= NeuG VARCHAR(65535)。
+
+    cognee 把 text 连同元数据 ``json.dumps`` 成 payload blob 写入 VARCHAR(65535)
+    列，超限会被 blob_guard 拒绝。裸字符/裸字节都不足以判定：ensure_ascii 转义
+    会把换行、引号、非 ASCII 放大（最坏 6x）。故直接测量转义后大小，仅当逼近
+    预算时二分收敛到满足字节上限的最大字符前缀。
+    """
+    budget = _MAX_BLOB_BYTES - _PAYLOAD_META_RESERVE
+    raw = text.encode("utf-8")
+    if len(raw) * 6 <= budget:          # 最坏转义也装得下，免测量
+        return text
+    if len(json.dumps(text).encode("utf-8")) - 2 <= budget:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(json.dumps(text[:mid]).encode("utf-8")) - 2 <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo]
 
 
 def _chunk_id(i: int) -> str:
@@ -141,6 +174,8 @@ def _patch_embedding_factory(stub):
 class CogneePerfAdapter(PerfAdapter):
     #: cognee 四类查询全支持（契约 §3.5）
     supported_classes = frozenset(ALL_CLASSES)
+    #: 向量直注分批大小；NeuG 臂覆盖为单批（每表一次 COPY 最优，见 NEUG_COPY_BATCH）
+    _vector_batch = VECTOR_BATCH
 
     def __init__(self):
         self._loop = None
@@ -291,7 +326,7 @@ class CogneePerfAdapter(PerfAdapter):
             self._chunk2sid[chunk_id] = sid
             self._sid2chunk[sid] = chunk_id
 
-        texts = [(text or "")[:MAX_STORED_TEXT_CHARS] for text in corpus.texts]
+        texts = [_fit_text_to_blob(text or "") for text in corpus.texts]
 
         async def _load_all():
             from cognee.infrastructure.databases.unified import get_unified_engine
@@ -310,8 +345,9 @@ class CogneePerfAdapter(PerfAdapter):
 
         NeuG 臂内部即 JSONL COPY FROM 批量写入；payload 带 session_id 供回映射。
         """
-        for start in range(0, n, VECTOR_BATCH):
-            end = min(start + VECTOR_BATCH, n)
+        batch = self._vector_batch
+        for start in range(0, n, batch):
+            end = min(start + batch, n)
             points = [
                 {
                     "id": _chunk_id(i),
@@ -331,7 +367,7 @@ class CogneePerfAdapter(PerfAdapter):
             await vector_engine.upsert_raw_vectors(
                 "DocumentChunk_text", points, payload_schema=_payload_schema_cls()
             )
-            if (start // VECTOR_BATCH) % 5 == 4 or end == n:
+            if (start // batch) % 5 == 4 or end == n:
                 print(f"[{self.name}] vectors {end}/{n}", flush=True)
 
     async def _load_graph(self, graph_engine, corpus, texts, n):
@@ -468,6 +504,8 @@ class CogneeNeuGPerfAdapter(CogneePerfAdapter):
     """with NeuG：向量 + 图全走 NeuG（同一嵌入式库），COPY 用 JSONL。"""
 
     name = "cognee-neug"
+    #: 单批覆盖全量 → 每表一次 COPY（消除多次 seal 的全表重写 + HNSW 重序列化）
+    _vector_batch = NEUG_COPY_BATCH
 
     def _provider_env(self, work_dir):
         return {
@@ -486,8 +524,8 @@ class CogneeNeuGPerfAdapter(CogneePerfAdapter):
 
         now = _now_iso()
         execute = graph_engine.connection_manager.execute
-        for start in range(0, n, VECTOR_BATCH):
-            end = min(start + VECTOR_BATCH, n)
+        for start in range(0, n, NEUG_COPY_BATCH):
+            end = min(start + NEUG_COPY_BATCH, n)
             rows = [
                 {
                     "id": _chunk_id(i),
@@ -508,8 +546,8 @@ class CogneeNeuGPerfAdapter(CogneePerfAdapter):
         now = _now_iso()
         execute = graph_engine.connection_manager.execute
         total = canonical_edges.shape[0]
-        for start in range(0, total, NEUG_EDGE_BATCH):
-            chunk = canonical_edges[start : start + NEUG_EDGE_BATCH]
+        for start in range(0, total, NEUG_COPY_BATCH):
+            chunk = canonical_edges[start : start + NEUG_COPY_BATCH]
             # REL 表 JSON 前两键为 from/to 端点主键
             rows = [
                 {
@@ -524,7 +562,7 @@ class CogneeNeuGPerfAdapter(CogneePerfAdapter):
             ]
             await copy_jsonl_rows(execute, "EDGE", rows, "(from='Node', to='Node')")
             print(
-                f"[{self.name}] edges {min(start + NEUG_EDGE_BATCH, total)}/{total}",
+                f"[{self.name}] edges {min(start + NEUG_COPY_BATCH, total)}/{total}",
                 flush=True,
             )
 

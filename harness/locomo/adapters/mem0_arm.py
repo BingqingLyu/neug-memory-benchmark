@@ -1,9 +1,9 @@
 """mem0 系统 LoCoMo adapter：with/without NeuG 两臂（mem0-neug / mem0-qdrant）。
 
 协议对齐（ADAPTER-CONTRACT.md）：
-- 会话隔离：摄入按 user_id=sample_id；harness 的 search 接口不带 sample_id，
-  故检索时逐 sample 带 user_id 过滤各查一次，再按分数合并取 top-k
-  （隔离条件照带，且两后端分数都归一到 [0,1]，跨 sample 可比）
+- 会话隔离：摄入按 user_id=sample_id；检索优先用题目携带的 sample_id 只查该
+  样本（约束1，与 graphiti/semantica 同口径），避免逐样本 N× 检索与跨样本合并
+  污染；仅当 harness 未传 sample_id 时才退回逐 sample 查再按分合并取 top-k
 - 抽取与 embedding 的 base_url 都指向缓存代理 → 换后端时抽取结果共享
 - embedding 用 DashScope text-embedding-v3（1024 维），抽取 LLM 用 qwen-plus
 - 后端切换是唯一变量：两臂除 vector_store 配置外完全一致
@@ -81,10 +81,15 @@ class Mem0ArmAdapter(SystemAdapter):
         # 收集的样本列表（保持摄入顺序去重）。
         self.sample_ids = list(dict.fromkeys(s["sample_id"] for s in sessions))
 
-    # ---- 检索：逐 sample 带隔离条件查，合并按分取 top-k；只回检索上下文 ----
-    def search(self, question, top_k=20):
+    # ---- 检索：优先按题目 sample_id 隔离只查该样本；缺省才逐 sample 合并 ----
+    def search(self, question, top_k=20, sample_id=None):
+        # 约束1 会话隔离：run_eval 逐题传 sample_id（timed_search 探测签名后转发），
+        # 用它只查题目所属样本——与 graphiti/semantica 同口径。不声明 sample_id 会
+        # 退化成遍历全部样本各查一次再跨样本合并：检索开销 ×N（LoCoMo N=10），且
+        # 其他样本的记忆会挤进 top-k 污染隔离。缺省（旧调用方）才保留逐样本合并。
+        sids = [sample_id] if sample_id else self.sample_ids
         hits: list[SearchHit] = []
-        for sid in self.sample_ids:
+        for sid in sids:
             res = self.memory.search(
                 question, top_k=top_k, threshold=0.0,
                 filters={"user_id": sid},
@@ -96,7 +101,7 @@ class Mem0ArmAdapter(SystemAdapter):
                     payload=str(r.get("memory") or ""),
                 ))
         hits.sort(key=lambda h: h.score, reverse=True)
-        return hits[:top_k], SearchTrace(extra={"n_samples": len(self.sample_ids)})
+        return hits[:top_k], SearchTrace(extra={"n_samples": len(sids)})
 
 
 class Mem0NeuGAdapter(Mem0ArmAdapter):

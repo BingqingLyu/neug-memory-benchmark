@@ -46,6 +46,9 @@ os.environ.setdefault("GRAPHITI_TELEMETRY_ENABLED", "false")  # import graphiti 
 
 import numpy as np  # noqa: E402
 
+# COPY 不接受绑定参数，写路径必须内联向量字面量——直接用 driver 的实现（纯
+# stdlib 模块，不 import 引擎，Neo4j 臂加载本文件同样安全），避免方言漂移。
+from graphiti_core.driver.neug.dialect import vector_literal  # noqa: E402
 from graphiti_core.search.search_config import (  # noqa: E402
     NodeReranker,
     NodeSearchConfig,
@@ -75,17 +78,6 @@ NEUG_RELATES_TO_COLUMNS = [
 CREATED_AT = "2026-01-01T00:00:00.000000+00:00"
 
 
-def _vector_literal(vec) -> str:
-    """FLOAT[N] 字面量：每个元素必须带小数点（NeuG 不做隐式类型转换）。"""
-    parts = []
-    for x in vec:
-        s = repr(float(x))
-        if "." not in s and "e" not in s and "E" not in s:
-            s += ".0"
-        parts.append(s)
-    return "[" + ", ".join(parts) + "]"
-
-
 class GraphitiPerfAdapter(PerfAdapter):
     #: graphiti 四类查询全支持（契约 §3.5 事实表）
     supported_classes = frozenset(ALL_CLASSES)
@@ -93,6 +85,8 @@ class GraphitiPerfAdapter(PerfAdapter):
     def __init__(self):
         self._loop = None
         self._driver = None
+        self._work_dir = None
+        self._dim = None             # 语料向量维度，load() 时从 corpus 取
         self._filters = SearchFilters()
         # graph 类邻域结果缓存：warmup 与计时重放同一种子，病态种子
         # （25k 邻域、276MB summary 序列化）只计费一次
@@ -115,22 +109,25 @@ class GraphitiPerfAdapter(PerfAdapter):
     def setup(self, work_dir):
         self._loop = asyncio.new_event_loop()
         self._clear_backend(work_dir)
+        self._work_dir = work_dir    # 中间产物落这里，不再摸 driver 私有属性
         self._driver = self._run(self._open_driver(work_dir))
 
     def teardown(self):
-        # NeuG 连接必须正常 close（checkpoint 纪律）
+        # NeuG 连接必须正常 close（checkpoint 纪律）。close 失败要传播：
+        # perf 的 work_dir 跨 run 复用，吞掉异常会让下一轮在残缺库上继续。
         if self._driver is not None:
             try:
                 self._run(self._driver.close())
-            except Exception:  # noqa: BLE001 - teardown 不抛错
-                pass
-            self._driver = None
+            finally:
+                self._driver = None
         if self._loop is not None:
             self._loop.close()
             self._loop = None
 
     # ---- load：预计算语料存储层直注，不经 LLM ----
     def load(self, corpus):
+        self._dim = int(corpus.embeddings.shape[1])
+
         async def _load():
             await self._load_nodes(corpus)
             await self._load_edges(corpus)
@@ -202,7 +199,10 @@ class GraphitiPerfAdapter(PerfAdapter):
                 driver=self._driver,
                 cross_encoder=None,       # rrf 重排不调 cross encoder
                 query=query,
-                query_vector=list(qvec) if qvec is not None else [0.0] * 1024,
+                # bm25/bfs 腿不消费 query_vector，但形参必填；维度取自语料而非
+                # 硬编码，换 embedding 模型时不会静默送错维度的零向量。
+                query_vector=(list(qvec) if qvec is not None
+                              else [0.0] * self._dim),
                 group_ids=None,
                 config=config,
                 search_filter=self._filters,
@@ -248,8 +248,14 @@ class GraphitiNeuGPerfAdapter(GraphitiPerfAdapter):
     def _db_dir(self, work_dir):
         return os.path.join(work_dir, "graphiti.db")
 
+    def _csv_dir(self, work_dir):
+        return os.path.join(work_dir, "csv")
+
     def _clear_backend(self, work_dir):
+        # COPY 的中间产物一并清：entity.csv 1.7GB + relates_to.csv 588MB 落在
+        # work_dir 下，而 work_dir 跨 run 复用，只删库它们会永久留在 results/。
         shutil.rmtree(self._db_dir(work_dir), ignore_errors=True)
+        shutil.rmtree(self._csv_dir(work_dir), ignore_errors=True)
 
     async def _open_driver(self, work_dir):
         from graphiti_core.driver.neug_driver import NeuGDriver
@@ -260,7 +266,7 @@ class GraphitiNeuGPerfAdapter(GraphitiPerfAdapter):
 
     async def _load_nodes(self, corpus):
         n = len(corpus.session_ids)
-        csv_dir = os.path.join(os.path.dirname(self._driver._database), "csv")
+        csv_dir = self._csv_dir(self._work_dir)
         os.makedirs(csv_dir, exist_ok=True)
         path = os.path.join(csv_dir, "entity.csv")
         t0 = time.time()
@@ -271,7 +277,7 @@ class GraphitiNeuGPerfAdapter(GraphitiPerfAdapter):
                 # corpus 向量已 L2 归一（与 driver 写前预归一约定等价）
                 w.writerow([
                     sid, sid,
-                    _vector_literal(corpus.embeddings[i].tolist()),
+                    vector_literal(corpus.embeddings[i].tolist()),
                     GROUP_ID, corpus.texts[i], "[]", "", CREATED_AT,
                 ])
                 if (i + 1) % 10000 == 0:
@@ -287,7 +293,8 @@ class GraphitiNeuGPerfAdapter(GraphitiPerfAdapter):
         ids = np.asarray(corpus.session_ids)
         src = ids[corpus.graph_edges[:, 0]]
         dst = ids[corpus.graph_edges[:, 1]]
-        csv_dir = os.path.join(os.path.dirname(self._driver._database), "csv")
+        csv_dir = self._csv_dir(self._work_dir)
+        os.makedirs(csv_dir, exist_ok=True)
         path = os.path.join(csv_dir, "relates_to.csv")
         t0 = time.time()
         with open(path, "w", newline="", encoding="utf-8") as f:

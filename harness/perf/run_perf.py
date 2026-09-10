@@ -58,9 +58,11 @@ def _load_adapters():
         ADAPTERS.setdefault(BruteForceAdapter.name, BruteForceAdapter)
 
     def _mem0():
-        from .adapters.mem0_arm import Mem0NeuGPerfAdapter, Mem0QdrantPerfAdapter
+        from .adapters.mem0_arm import (Mem0NeuGPerfAdapter, Mem0QdrantPerfAdapter,
+                                        Mem0QdrantServerPerfAdapter)
         ADAPTERS.setdefault(Mem0NeuGPerfAdapter.name, Mem0NeuGPerfAdapter)
         ADAPTERS.setdefault(Mem0QdrantPerfAdapter.name, Mem0QdrantPerfAdapter)
+        ADAPTERS.setdefault(Mem0QdrantServerPerfAdapter.name, Mem0QdrantServerPerfAdapter)
 
     def _graphiti():
         from .adapters.graphiti_arm import GraphitiNeuGPerfAdapter, GraphitiNeo4jPerfAdapter

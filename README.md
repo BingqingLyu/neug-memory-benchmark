@@ -63,7 +63,7 @@ adapter 注册为容错式：某系统实现或依赖未就位时自动跳过，
 |---|---|---|
 | mem0 | qdrant | NeuG vector store（fork 分支 `feature/neug-vector-store`） |
 | cognee | 内置 LanceDB 栈 | NeuG graph adapter（fork 分支 `feature/neug-graph-adapter`） |
-| graphiti | Neo4j | NeuG driver（开发中） |
+| graphiti | Neo4j | NeuG driver（fork 分支 `neug-driver`） |
 | semantica | 原生内存栈 | NeuG 后端（bm25 全文路仅 NeuG 提供） |
 
 ## 数据集

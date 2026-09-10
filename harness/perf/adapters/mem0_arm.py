@@ -1,4 +1,4 @@
-"""mem0 性能赛道 adapter：with/without NeuG 两臂（mem0-neug / mem0-qdrant）。
+"""mem0 性能赛道 adapter：with/without NeuG 多臂（mem0-neug / mem0-qdrant / mem0-qdrant-server）。
 
 契约对齐（PERF-ADAPTER-CONTRACT.md）：
 - 存储层直注、绕过 LLM 抽取：corpus 的预计算向量/原文经 Memory.vector_store.insert
@@ -20,6 +20,10 @@ import os
 import time  # noqa: E402
 
 os.environ.setdefault("MEM0_TELEMETRY", "False")  # 必须在 import mem0 前
+# qdrant 臂的 BM25 关键词检索（fts_keyword/hybrid）依赖 fastembed 的 Qdrant/bm25
+# 模型，首次使用需从 HuggingFace 拉取。本环境 huggingface.co 不可达，默认走 hf-mirror
+# 镜像；setdefault 保留外部覆盖能力。必须在 import mem0（→fastembed→hf_hub）前设置。
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 import shutil  # noqa: E402
 import uuid  # noqa: E402
@@ -63,6 +67,9 @@ class Mem0PerfAdapter(PerfAdapter):
     #: 基类=qdrant 臂口径：无图遍历 → graph_multihop N/A。NeuG 臂在子类里
     #: 覆盖 supported_classes 补上 GRAPH_MULTIHOP（neug store 有原生关系表）。
     supported_classes = frozenset({VECTOR_TOPK, FTS_KEYWORD, HYBRID})
+    #: vector_store.insert 分批大小。qdrant server 臂走 REST，单批 payload 受
+    #: 32MB 请求体上限约束（见 Mem0QdrantServerPerfAdapter.insert_batch 覆写）。
+    insert_batch = INSERT_BATCH
 
     def __init__(self):
         self.memory = None
@@ -122,8 +129,8 @@ class Mem0PerfAdapter(PerfAdapter):
     def load(self, corpus):
         store = self.memory.vector_store
         n = len(corpus.session_ids)
-        for start in range(0, n, INSERT_BATCH):
-            end = min(start + INSERT_BATCH, n)
+        for start in range(0, n, self.insert_batch):
+            end = min(start + self.insert_batch, n)
             ids, payloads = [], []
             for i in range(start, end):
                 # qdrant 主键只接受 int/UUID 字符串，两臂统一用 uuid，
@@ -140,7 +147,7 @@ class Mem0PerfAdapter(PerfAdapter):
                 })
             store.insert(vectors=[list(v) for v in corpus.embeddings[start:end]],
                          payloads=payloads, ids=ids)
-            if (start // INSERT_BATCH) % 10 == 9 or end == n:
+            if (start // self.insert_batch) % 10 == 9 or end == n:
                 print(f"[{self.name}] loaded {end}/{n}", flush=True)
 
     # ---- 四类查询 ----
@@ -305,3 +312,143 @@ class Mem0QdrantPerfAdapter(Mem0PerfAdapter):
 
     def _backend_dirs(self, work_dir):
         return [os.path.join(work_dir, "qdrant")]
+
+    def load(self, corpus):
+        super().load(corpus)
+        # 载入后自检 BM25 能力：insert 已触发编码器 lazy-load，此时状态已确定。
+        self._verify_bm25_encoder()
+
+    def _verify_bm25_encoder(self):
+        """qdrant FTS 能力自检，不可用则 fail loudly（而非静默记 recall=0）。
+
+        keyword_search 依赖 fastembed 的 Qdrant/bm25 稀疏向量。若编码器加载失败
+        （fastembed 缺失，或 HF 不可达且模型未缓存），mem0 只记 warning 不抛错——
+        insert 会静默跳过 bm25 稀疏向量、keyword_search 查空，fts_keyword/hybrid 的
+        recall 被误记成 0.0000（本赛道曾因此产出 qdrant fts=0 的假结果）。这里主动
+        探测：既然声明支持 FTS_KEYWORD，就必须真具备 BM25 能力，否则报错并给指引。
+        """
+        store = self.memory.vector_store
+        has_slot = getattr(store, "_has_bm25_slot", False)
+        encoder = store._get_bm25_encoder() if has_slot else None
+        if has_slot and encoder is not None:
+            return
+        reason = ("collection 无 bm25 稀疏槽（pre-v3 结构）" if not has_slot
+                  else "fastembed 的 Qdrant/bm25 编码器加载失败")
+        raise RuntimeError(
+            f"[{self.name}] BM25 关键词能力不可用（{reason}）：fts_keyword/hybrid 会被"
+            f"静默记成 recall=0。Qdrant/bm25 模型首次使用需从 HuggingFace 拉取，本环境"
+            f" huggingface.co 不可达——请设 HF_ENDPOINT=https://hf-mirror.com（本模块已"
+            f"默认设置，若被外部覆盖请检查）并确保已安装 fastembed，然后重跑。"
+        )
+
+
+class Mem0QdrantServerPerfAdapter(Mem0QdrantPerfAdapter):
+    """qdrant server 模式臂：连本机 docker qdrant（host/port），建真 HNSW 索引。
+
+    与 mem0-qdrant（local 模式，纯 Python 暴力扫、默认不建 ANN 索引）的关键区别：
+    - server 模式 is_local=False → create_col 额外走 _create_filter_indexes（payload
+      过滤索引），且向量集合按 qdrant 默认 HNSW（实测 1.19.1：m=16 / ef_construct=100 /
+      indexing_threshold=10000）在点数超阈值后异步建 ANN 索引——这才是“建了索引的
+      生产级 qdrant”，堵住“neug 只赢在跟没建索引的 local 模式比”的公平性质疑。
+    - load() 直注后阻塞等 status=green（优化器收敛、所有段合并且 HNSW 建完），把构建
+      耗时计入 load_seconds_bg，与 NeuG index-first（COPY 进已建 HNSW 表）的 eager 成本同口径。
+    - BM25 关键词能力与 local 臂同一套（fastembed Qdrant/bm25 稀疏向量 + HF_ENDPOINT
+      镜像），继承 _verify_bm25_encoder 自检；无图遍历 → graph_multihop 仍 N/A。
+    连接信息用 BENCH_QDRANT_HOST / BENCH_QDRANT_PORT 覆盖（默认 localhost:6333）。
+    """
+    name = "mem0-qdrant-server"
+    #: qdrant server 走 REST upsert，单请求体默认上限 32MB(service.max_request_size_mb)。
+    #: 每点约 42.5KB（1024维 dense 的 JSON + bm25 稀疏向量 + text payload），基类的
+    #: 1000/批 ≈ 42.5MB 会被 400 Bad Request 拒。降到 256/批（≈11MB）留足余量。
+    #: load 是背景成本、非对比指标（run_perf.py 明载），批大小不影响查询延时/recall 的
+    #: 公平性；HNSW 由 qdrant 优化器按总点数异步构建，与 upsert 批大小无关。
+    insert_batch = 256
+
+    def _host_port(self):
+        host = os.environ.get("BENCH_QDRANT_HOST", "localhost")
+        port = int(os.environ.get("BENCH_QDRANT_PORT", "6333"))
+        return host, port
+
+    def _vector_store_config(self, work_dir):
+        host, port = self._host_port()
+        return {"provider": "qdrant", "config": {
+            "collection_name": "mem0",
+            "host": host,
+            "port": port,
+            "embedding_model_dims": EMBED_DIMS,
+        }}
+
+    def _backend_dirs(self, work_dir):
+        # server 模式数据在容器里，无本地目录可清；history.db 仍由基类 setup 清理。
+        return []
+
+    def setup(self, work_dir):
+        # create_col 遇已存在集合会跳过不重建（qdrant.py:137）→ 每次跑前先 drop，
+        # 保证从空库开始（幂等）。entity_store 惰性且直注模式不触发，防御性一并 drop。
+        self._drop_server_collections()
+        super().setup(work_dir)
+
+    def _drop_server_collections(self):
+        from qdrant_client import QdrantClient
+        host, port = self._host_port()
+        client = QdrantClient(host=host, port=port)
+        try:
+            for name in ("mem0", "mem0_entities"):
+                try:
+                    if client.collection_exists(name):
+                        client.delete_collection(name)
+                        print(f"[{self.name}] dropped stale collection {name}",
+                              flush=True)
+                except Exception as e:  # noqa: BLE001 - 不存在/已删都容忍
+                    print(f"[{self.name}] drop {name} skipped: {e}", flush=True)
+        finally:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def load(self, corpus):
+        super().load(corpus)   # 直注 + BM25 自检（继承 Mem0QdrantPerfAdapter）
+        self._wait_hnsw_index(len(corpus.session_ids))
+
+    def _wait_hnsw_index(self, expected_points, timeout_s=900, poll_s=3,
+                         stable_polls=3):
+        """阻塞等 qdrant 后台优化器把 HNSW 建完并收敛（status=green）。
+
+        收敛判据用 status==green 而非 indexed_vectors_count>=points_count：后者在
+        qdrant 里会被 dense+bm25 双向量各计一次而虚高（实测 green 时 indexed=2×points），
+        一插入就恒成立、会 0s 误判“建完”。green 表示所有段已合并且 HNSW 构建完成，
+        才是“建了索引的生产级 qdrant”的可靠信号。51661 点 > indexing_threshold(10000)
+        会触发异步建 HNSW；不等建完就计时查询会测到“半建索引”的失真延迟。等待计入
+        load_seconds_bg，与 NeuG index-first eager 构建同口径对比（两者都在 load 阶段
+        付清 ANN 索引成本）。
+        """
+        store = self.memory.vector_store
+        client = store.client
+        t0 = time.time()
+        last = None
+        stable = 0
+        while True:
+            info = client.get_collection(store.collection_name)
+            points = getattr(info, "points_count", 0) or 0
+            indexed = getattr(info, "indexed_vectors_count", 0) or 0
+            status = str(getattr(info, "status", "")).lower()
+            elapsed = time.time() - t0
+            sig = (points, indexed, status)
+            if sig != last:
+                print(f"[{self.name}] HNSW indexing: points={points} "
+                      f"indexed={indexed} status={status} ({elapsed:.0f}s)", flush=True)
+                last = sig
+                stable = 0
+            else:
+                stable += 1
+            if status == "green" and points >= expected_points and stable >= stable_polls:
+                print(f"[{self.name}] HNSW converged: points={points} indexed={indexed} "
+                      f"status=green in {elapsed:.0f}s", flush=True)
+                return
+            if elapsed > timeout_s:
+                print(f"[{self.name}] WARN HNSW indexing timed out (points={points} "
+                      f"indexed={indexed} status={status}) after {timeout_s}s; proceeding",
+                      flush=True)
+                return
+            time.sleep(poll_s)

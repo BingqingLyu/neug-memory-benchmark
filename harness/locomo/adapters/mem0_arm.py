@@ -12,6 +12,10 @@
 import os
 
 os.environ.setdefault("MEM0_TELEMETRY", "False")  # 必须在 import mem0 前
+# qdrant 臂的 BM25 关键词检索依赖 fastembed 的 Qdrant/bm25 模型，首次使用需从
+# HuggingFace 拉取；本环境 huggingface.co 不可达，默认走 hf-mirror 镜像（与 perf
+# 赛道 mem0_arm 同策略）。必须在 import mem0（→fastembed→hf_hub）前设置。
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 from mem0 import Memory  # noqa: E402
 

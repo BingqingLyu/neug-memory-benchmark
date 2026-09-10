@@ -4,14 +4,17 @@
 - 存储层直注、绕 LLM 抽取：预计算向量/文本/规范共现图原样载入，全程 0 次
   LLM/embedding 调用（约束 1/2）。
 - NEUG 臂：COPY FROM JSONL 批量冲刷（index-first：HNSW+FTS 先建后 COPY，
-  第一步 P13 已验证路径），冲刷前客户端去重（重复 PK 静默跳过）。
+  第一步 P13 已验证路径）。重复 PK 的去重由 backend 的 copy_nodes/copy_edges
+  在写 JSONL 前完成（semantica_patch/neug_store.py，引擎侧对重复 PK 静默
+  跳过），adapter 不做第二遍。
 - NATIVE 臂：Semantica 存储层直写——内存 ContextGraph（add_nodes/add_edges）
   + 原生 FAISS vector store（flat + inner_product，归一向量上等价余弦）。
 - 四类查询走系统检索路径（约束 3）：
   vector = neug HNSW vector_distance_cosine / native FAISS search_vectors
   fts    = neug bm25；native 无全文路（原生栈源码事实），标 N/A（B3）
   hybrid = Semantica 原生 _rank_and_merge 融合（neug: 向量+bm25；
-           native: 纯向量——无词法成分，是能力差不是配置差）
+           native: 纯向量——无词法成分，是能力差不是配置差）。native 侧分值
+           必须取 FAISS 的 distance（=余弦）而非 score，见 _faiss_ip_score
   graph  = neug get_neighbors varlen 服务端遍历（无向 *1..2）/
            native ContextGraph.get_neighbors(hops=2)；均返回完整邻域
            （⊇ 按 hop 截断的 GT，契约 §6，勿全局 top-N 截断）
@@ -29,7 +32,7 @@ import numpy as np
 # semantica / semantica_patch 经 benchmark venv 的 editable 安装提供，
 # 与 graphiti/mem0/cognee 三系统同惯例（裸导入，无 sys.path 注入）。
 
-from ..base import (  # noqa: E402
+from ..base import (
     ALL_CLASSES,
     GRAPH_MULTIHOP,
     HYBRID,
@@ -37,14 +40,43 @@ from ..base import (  # noqa: E402
     VECTOR_TOPK,
 )
 
-NODE_BATCH = 5000          # neug 节点 COPY 分片（节点带 1024 维向量，单批过大会 OOM）
-# NeuG 每次 COPY FROM 调用有一笔 ∝ 表内已有行数 的固定开销（CSR/PK 重建），
-# 批内插入本身极快。实测 2.8M 边：拆 14 批 = 3674s，单次 COPY = 2.6s（>1000x）。
-# 边行不含向量（JSONL ~250MB），故 neug 臂边载入合并为单次 COPY。
+# NeuG 每次 COPY FROM 有一笔 ∝ 表内已有行数 的固定开销：每次 seal 都要把该表
+# 在 checkpoint 里整表重写（引擎自己会 warn "Incremental checkpoint rewrites
+# vertex table 'Entity' ... consider batching COPY statements"）。所以分片是净
+# 亏损，不是防 OOM 的手段 —— 实测 51661 个 1024 维节点：
+#   11 批(5000)  = 182.4s, peak RSS 12.9GB
+#    3 批(20000) = 147.0s, peak RSS 13.3GB
+#    1 批(51661) = 136.4s, peak RSS  9.2GB   ← 更快且更省内存
+# 分批抬高 RSS 是因为每批的 checkpoint 副本叠加。真正的上限在 Python 侧：rows
+# 把 1024 维向量摊成 float 列表（≈32KB/行），再加 _copy_jsonl 的文本副本，
+# 全量单批约 2.7GB。故取一个 > 当前语料、又不至于撑爆 Python 的值。
+NODE_BATCH = 60_000          # > 语料节点数（51661）→ 单次 COPY
 NEUG_EDGE_COPY_BATCH = 5_000_000   # > 语料边数（2799244）→ 单次 COPY
 EDGE_BATCH = 200_000       # native ContextGraph.add_edges 分片（无此惩罚，按内存分片）
 FAISS_ADD_BATCH = 20_000   # native FAISS add_vectors 批
 EDGE_TYPE = "COOCCURS"     # 规范共现边类型（两臂一致）
+
+
+def _faiss_ip_score(hit: dict) -> float:
+    """把 FAISS inner_product 命中换算成与 neug 臂同标度的余弦分。
+
+    FAISSSearch.search_similar 的 "score" 是 1/(1+max(0,dist))，而
+    inner_product 下 FAISS 返回的 dist 本身就是余弦（语料与 query_vectors.npy
+    均已 L2 归一，实测范数 1.0±1e-7）—— 该变换是余弦的严格递减函数（实测
+    cos=1.0 -> 0.500、cos=0.0 -> 1.000）。直接当分值喂进 _rank_and_merge，
+    min-max 归一化后整路排序被反转，返回的是"最不相关"的前 top_k。
+    perf 的 recall_at_k 取 set(returned[:k])，对顺序不敏感，所以这个 bug 在
+    指标上看不出来，但违反 base.py「均返回按相关度排序」的契约。
+    neug 臂 NeugVectorStore.search 给的是 1 - cos_distance/2 = (1+cos)/2，
+    这里取同一公式，两臂分值可直接互比。
+
+    只适用于 FAISS 命中：两臂的 hit dict 都有 "distance" 键但语义相反
+    （neug = 余弦距离，0 为相同；FAISS inner_product = 余弦相似度，1 为
+    相同），把本函数用在 neug 命中上会得到反向分。neug 的 "score" 已经
+    是正确的，直接用。
+    """
+    cos = float(hit["distance"])
+    return max(0.0, min(1.0, (1.0 + cos) / 2.0))
 
 
 class SemanticaNeuGPerfAdapter(PerfAdapter):
@@ -94,6 +126,9 @@ class SemanticaNeuGPerfAdapter(PerfAdapter):
         m = len(edges)
         for start in range(0, m, NEUG_EDGE_COPY_BATCH):
             end = min(start + NEUG_EDGE_COPY_BATCH, m)
+            # 单次 COPY 意味着这里一次性物化 2.8M 个 dict（≈600MB），随后
+            # _copy_jsonl 再摊成 ~250MB 文本，两份同时在峰值上。合并成单次是
+            # 值得的（分批 3674s vs 单次 2.6s），但内存账要认。
             rows = [
                 {"from_id": str(ids[a]), "to_id": str(ids[b]),
                  "edge_type": EDGE_TYPE, "weight": 1.0}
@@ -116,13 +151,21 @@ class SemanticaNeuGPerfAdapter(PerfAdapter):
         results = []
         for h in self._vec.search(list(qvec), top_k=top_k):
             results.append(RetrievedContext(
-                content=h["metadata"].get("content", ""), score=h["score"],
+                # content 直接下标：load() 给每个节点都写了 corpus.texts[i]。
+                # 这里比 locomo 臂更不能容它默默变空：content 是
+                # _rank_and_merge 的 content[:100] 去重键，全路空串会撞成
+                # 同一个键、把整条向量路去重成 1 条，而 hybrid recall 只会
+                # 看上去偏低，没任何异常信号。
+                content=h["metadata"]["content"], score=h["score"],
                 source=f"vector:{h['id']}", metadata={"node_id": h["id"]}))
         for h in self._fts.search(" ".join(keywords), limit=top_k):
             results.append(RetrievedContext(
                 content=h["content"], score=h["relevance"],
                 source=f"vector:fts:{h['id']}", metadata={"node_id": h["id"]}))
         merged = self._retriever._rank_and_merge(results, " ".join(keywords))
+        # 不需 locomo 臂那道跨路去重：向量与 bm25 两路同为 "vector:" 前缀，
+        # 共用一个 content[:100] 去重池（同一节点从两路命中会归并成一条），
+        # 且 content 恒为真实 session 文本、不会为空而撞到同一个 "" 键。
         return [r.metadata["node_id"] for r in merged[:top_k]]
 
     def query_graph(self, seed_session_id, max_nodes):
@@ -146,7 +189,6 @@ class SemanticaNativePerfAdapter(PerfAdapter):
         self._cg = None
         self._vs = None
         self._retriever = None
-        self._content: dict[str, str] = {}
 
     def setup(self, work_dir):
         from semantica.context.context_graph import ContextGraph
@@ -172,7 +214,6 @@ class SemanticaNativePerfAdapter(PerfAdapter):
                           for sid in corpus.session_ids[start:end]])
             print(f"[{self.name}] vectors {end}/{n} ({time.time() - t0:.0f}s)",
                   flush=True)
-        self._content = dict(zip(corpus.session_ids, corpus.texts))
 
         # 无向边表按双向各写一条：ContextGraph 邻接是出边单向存储，
         # get_neighbors 走出边，双向写入才是无向遍历（与 graphiti 臂同法）。
@@ -199,6 +240,8 @@ class SemanticaNativePerfAdapter(PerfAdapter):
         print(f"[{self.name}] loaded in {time.time() - t0:.0f}s", flush=True)
 
     def query_vector(self, qvec, top_k):
+        # FAISS 返回序即相关度降序（IP 度量下 index.search 内部排好），按原序
+        # 取 id 就是契约要的排序；不要按 r["score"] 重排，那个字段是倒的。
         res = self._vs.search_vectors(np.asarray(qvec, dtype=np.float32),
                                       k=top_k)
         return [r["id"] for r in res]
@@ -214,8 +257,12 @@ class SemanticaNativePerfAdapter(PerfAdapter):
         results = []
         for r in self._vs.search_vectors(np.asarray(qvec, dtype=np.float32),
                                          k=top_k):
+            # content 只被 _rank_and_merge 用来按 content[:100] 去重，取图里
+            # 那一份即可（add_nodes 无条件覆盖 add_edges 建的占位节点，故这里
+            # 一定是真实文本）；不再另存一份 id->text 字典。
             results.append(RetrievedContext(
-                content=self._content.get(r["id"], ""), score=r["score"],
+                content=self._cg.nodes[r["id"]].content,
+                score=_faiss_ip_score(r),
                 source=f"vector:{r['id']}", metadata={"node_id": r["id"]}))
         merged = self._retriever._rank_and_merge(results, " ".join(keywords))
         return [r.metadata["node_id"] for r in merged[:top_k]]
@@ -226,5 +273,4 @@ class SemanticaNativePerfAdapter(PerfAdapter):
                                                         hops=2)]
 
     def teardown(self):
-        # 内存栈无需 close；保持空实现与接口对齐。
-        self._content = {}
+        """内存栈无需 close；空实现只为与接口对齐，语料与图随 runner 释放。"""

@@ -62,7 +62,6 @@ class GraphitiArmAdapter(SystemAdapter):
         self._loop = None
         self._driver = None
         self.graphiti = None
-        self._last_group = None
         self._ingested: set[tuple[str, int]] = set()
 
     # ---- 生命周期 ----
@@ -80,12 +79,12 @@ class GraphitiArmAdapter(SystemAdapter):
         if self.backend == "neug":
             from graphiti_core.driver.neug_driver import NeuGDriver
 
-            # 跨 run 复用同一库：run_eval 每 run 给独立 work_run{N}，但 QA 阶段
-            # 对图只读，没必要重建；库落在 work_run{N} 的父目录，首跑摄入、
-            # 后续 run 由幂等守卫跳过（全量库仅 85MB，需隔离时 cp 一份即可）。
-            db_dir = wd.parent if wd.name.startswith("work_run") else wd
+            # 库必须落在 work_dir 内：run_eval 的过期守卫靠 rmtree(work_dir)
+            # 整库重建（摄入规模变了就不能新旧混用）；放父目录会逃过删除，
+            # 再被 _sync_ingested_from_db 回填成已摄入 → 静默在旧数据上继续 QA。
+            # 跨 run 复用不需要绕行：run_eval:105 对 run>0 直接传 work_run0。
             self._driver = NeuGDriver(
-                db_path=str(db_dir / "graphiti.db"), embedding_dim=EMBED_DIM
+                db_path=str(wd / "graphiti.db"), embedding_dim=EMBED_DIM
             )
         else:
             from graphiti_core.driver.neo4j_driver import Neo4jDriver
@@ -196,9 +195,55 @@ class GraphitiArmAdapter(SystemAdapter):
                   f"{(time.time()-t0)/60:.1f}min elapsed", flush=True)
         self._ingested.update((s["sample_id"], s["session_idx"]) for s in pending)
 
+    def reuse_ingested(self, sessions):
+        """marker 存在也必须过 ingest_all 的幂等守卫，不能直接当"已摄入"。
+
+        run_eval:117 在 marker 存在时调本方法而**不调** ingest_all，而基类
+        实现是空的（base.py:62-67）。于是库一旦与 marker 失配就静默跑空图：
+        setup() 在 work_dir 内新建一个空库，_sync_ingested_from_db() 回填 0
+        条 Episodic，QA 全程 0 命中，run 却报成功。真实发生过——旧库落在
+        work_run0 的**父目录**（results/locomo/graphiti-neug/graphiti.db），
+        rmtree(work_dir) 删得掉 marker 删不掉库，两者就此脱钩；与 2026-09-09
+        semantica 臂塌缩成纯 bm25、差值被误读成代码收益是同一族事故。
+
+        委托给 ingest_all 即可自愈，不需要抛：它的 pending 过滤依赖
+        _ingested，而 _ingested 是 setup 时从**库里真实的 Episodic 行**回填
+        的，不看 marker。健康冻结库 -> pending 为空 -> 瞬间 no-op；空库或
+        错库 -> pending 为全量 -> 重新摄入。重摄入不贵：llm_proxy 把抽取与
+        嵌入缓存在 results/cache/llm_proxy/cache.db，重跑走缓存命中。
+        """
+        self.ingest_all(sessions)
+        self._assert_edge_leg()
+
+    def _assert_edge_leg(self):
+        """复用路径的唯一不可信点：确认检索真正读的边确实在库里。
+
+        与 semantica 的 _assert_vector_leg 同理——宁可炸，不要静默出数。
+        graphiti 的检索回的是边 facts（见 search），Episodic 有行不代表边
+        写进去了，而空边集只会让每题 0 命中，与"确实没召回"无法区分。
+        """
+        assert self.graphiti is not None
+
+        async def _q():
+            recs, _, _ = await self.graphiti.driver.execute_query(
+                "MATCH (:Entity)-[r:RELATES_TO]->(:Entity) RETURN count(r) AS c"
+            )
+            return recs
+
+        recs = self._run(_q())
+        n = int(recs[0]["c"]) if recs else 0
+        if n == 0:
+            raise RuntimeError(
+                f"{self.name}: store has {len(self._ingested)} episodes but ZERO "
+                "RELATES_TO edges, so every question would retrieve nothing and "
+                "the run would report a plausible-looking 0. The store and "
+                ".ingest_complete are out of step -- delete work_run0 and "
+                "re-ingest. The store must live INSIDE work_dir (see setup) so "
+                "rmtree clears both together."
+            )
+
     def ingest_session(self, sample_id: str, session_idx: int, date_time: str, text: str):
         assert self.graphiti is not None
-        self._last_group = sample_id
         self._run(
             self.graphiti.add_episode(
                 name=f"{sample_id}-{session_idx}",
@@ -211,26 +256,28 @@ class GraphitiArmAdapter(SystemAdapter):
 
     # ---- 检索：只回边 facts，答题归 harness ----
     def search(self, question: str, top_k: int = 20, sample_id: str | None = None):
-        # 约束 1 会话隔离：优先用题目携带的 sample_id。
-        # 不能用"最后一次摄入的样本"兑底当主路径：多样本全量跑时它只会命中最后一个样本。
-        group = sample_id or self._last_group
-        if group is None:
-            return [], SearchTrace(extra={"error": "no group ingested"})
+        # 约束 1 会话隔离：group_id = 题目携带的 sample_id，必填。缺失就抛——
+        # "最后一次摄入的样本"兜底在多样本全量跑时只会命中最后一个样本，而
+        # 复用库路径下 ingest_session 根本不跑，它只会静默退化成 0 命中。
+        if sample_id is None:
+            raise ValueError("graphiti arm requires sample_id for group isolation")
         assert self.graphiti is not None
         edges = self._run(
             self.graphiti.search(
-                question, group_ids=[group], num_results=top_k
+                question, group_ids=[sample_id], num_results=top_k
             )
         )
         hits = [
             SearchHit(
-                id=getattr(e, "uuid", str(i)),
-                score=float(getattr(e, "score", 0.0) or 0.0),
+                id=e.uuid,
+                # graphiti 的 search() 不回传相关度分数（EntityEdge 无 score 字段），
+                # harness 也只按返回顺序拼上下文、从不按 score 排序。
+                score=0.0,
                 payload=self._payload(e),
             )
-            for i, e in enumerate(edges)
+            for e in edges
         ]
-        return hits, SearchTrace(extra={"group_id": group})
+        return hits, SearchTrace(extra={"group_id": sample_id})
 
     @staticmethod
     def _payload(edge) -> str:

@@ -39,7 +39,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from ..base import ALL_CLASSES, PerfAdapter
+from ..base import ALL_CLASSES, GRAPH_MULTIHOP, PerfAdapter
 
 EMBED_DIMS = 1024
 # NeuG 集合表 text/payload 列与图节点 properties 列均为 VARCHAR(65535 字节)；
@@ -636,3 +636,176 @@ class CogneeBuiltInPerfAdapter(CogneePerfAdapter):
                 f"[{self.name}] edges {min(start + LADYBUG_EDGE_SHARD, total)}/{total}",
                 flush=True,
             )
+
+
+# neo4j 服务端图臂的批量写批大小（auto-commit tx/批）：
+# - 节点批受 bolt 单消息体 + text blob 大小约束（语料最长 text ~64KB），取小批防撑爆；
+# - 边值仅两个 UUID 串，批可大，减少 round-trip。
+NEO4J_NODE_BATCH = 500
+NEO4J_EDGE_BATCH = 50000
+
+
+class CogneeNeo4jPerfAdapter(CogneePerfAdapter):
+    """cognee + neo4j（服务端图）臂：graph-only，仅对比 graph_multihop。
+
+    为什么存在：cognee-neug / cognee-lancedb 只覆盖了"嵌入式/零配置"内置后端
+    （ladybug/kuzu 图 + lancedb 向量）。neo4j 是 cognee 的旗舰**服务端**图后端，
+    reviewer 常问"跟 neo4j 比呢？"。本臂补上这个数据点。
+
+    关键实现约束（均为实测事实，见 results/perf/cognee-neo4j/NOTES.md）：
+    - neo4j 是纯图后端（无向量）→ 本臂只跑 GRAPH_MULTIHOP，vector/fts/hybrid 归 N/A
+      （supported_classes 裁剪）；load 亦跳过向量直注（graph-only）。
+    - 本机 neo4j 是 Community 2026.07.1 单库、且被 graphiti/semantica 臂共享
+      → load 前只 scoped 清 :Node/:EDGE（本臂命名空间，实测当前各为 0，无碰撞），
+      绝不学 graphiti 臂全库 wipe（会误删其他臂的图）。
+    - server 无 APOC（实测 Unknown function 'apoc.version'）→ 不能用 cognee
+      Neo4jAdapter.add_nodes/add_edges（依赖 apoc.create.addLabels /
+      apoc.merge.relationship，且其 BASE_LABEL='__Node__' 与本赛道 :Node 口径不符）；
+      改用其 query() 跑 APOC-free 原生 Cypher，写 :Node/:EDGE 精确匹配基类
+      query_graph 的 MATCH (n:Node)-[:EDGE*1..2]-(m:Node)。
+    - Neo4jAdapter.query() 返回 List[Dict]（result.data()），基类 query_graph 行解析
+      （row[0] / row）不处理 dict → 覆盖 query_graph 解析 row["mid"]；Cypher 语义与
+      其他臂逐字一致（仅 RETURN 加 AS mid 别名），对比公平。
+    - embedded-vs-server 口径：neo4j 是 client-server（每次遍历含网络往返），NeuG 是
+      进程内嵌入式；本臂延迟差含部署形态差，诚实标注、不宣称为纯引擎优劣。
+    """
+
+    name = "cognee-neo4j"
+    #: neo4j 无向量能力，本臂只为图侧对比 → 只跑 graph_multihop
+    supported_classes = frozenset({GRAPH_MULTIHOP})
+
+    def _provider_env(self, work_dir):
+        return {
+            # neo4j 纯图；给向量后端一个隔离到 work_dir 的合法值（本臂不 load/查询向量，
+            # 仅为 unified/config 解析兜底）
+            "VECTOR_DB_PROVIDER": "lancedb",
+            "VECTOR_DB_URL": os.path.join(work_dir, "cognee.lancedb"),
+            # 连本机共享 neo4j server；凭据与 graphiti/semantica 的 neo4j 臂同源
+            "GRAPH_DATABASE_PROVIDER": "neo4j",
+            "GRAPH_DATABASE_URL": os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
+            "GRAPH_DATABASE_USERNAME": os.environ.get("NEO4J_USER", "neo4j"),
+            "GRAPH_DATABASE_PASSWORD": os.environ.get("NEO4J_PASSWORD", "testpass"),
+        }
+
+    def _backend_dirs(self, work_dir):
+        # neo4j 数据在共享 server（非文件系统）；lancedb 目录不会被创建（不 load 向量），
+        # 列出仅为 setup 幂等清理兜底
+        return [os.path.join(work_dir, "cognee.lancedb")]
+
+    # ---- load：graph-only（跳过向量直注）；scoped 清库 + APOC-free 原生 Cypher 批量写 ----
+    def load(self, corpus):
+        n = len(corpus.session_ids)
+        for i, sid in enumerate(corpus.session_ids):
+            chunk_id = _chunk_id(i)
+            self._chunk2sid[chunk_id] = sid
+            self._sid2chunk[sid] = chunk_id
+
+        texts = [_fit_text_to_blob(text or "") for text in corpus.texts]
+
+        async def _load_all():
+            from cognee.infrastructure.databases.graph import get_graph_engine
+
+            graph_engine = await get_graph_engine()
+            await self._clear_neo4j_graph(graph_engine)
+            await self._load_graph(graph_engine, corpus, texts, n)
+
+        self._run(_load_all())
+
+    async def _clear_neo4j_graph(self, graph_engine):
+        """scoped 清 :Node/:EDGE（本臂命名空间），保留共享 server 上其他臂的图。
+
+        分批删：百万级边单事务会撑爆 neo4j 事务内存；先删 :EDGE 再删孤立 :Node。
+        """
+        while True:
+            data = await graph_engine.query(
+                "MATCH (:Node)-[r:EDGE]->(:Node) WITH r LIMIT 100000 DELETE r RETURN count(*) AS c"
+            )
+            if not data or not data[0].get("c"):
+                break
+        while True:
+            data = await graph_engine.query(
+                "MATCH (n:Node) WITH n LIMIT 50000 DELETE n RETURN count(*) AS c"
+            )
+            if not data or not data[0].get("c"):
+                break
+        print(f"[{self.name}] cleared :Node/:EDGE (scoped)", flush=True)
+
+    async def _copy_nodes(self, graph_engine, corpus, texts, n):
+        # :Node(id) 唯一约束 = neo4j 侧的"建索引"：MERGE 与 query_graph 的 n.id 定位都靠它，
+        # 公平且必需（对齐 neug index-first / lancedb 建表）。
+        await graph_engine.query(
+            "CREATE CONSTRAINT perf_node_id_unique IF NOT EXISTS "
+            "FOR (n:Node) REQUIRE n.id IS UNIQUE"
+        )
+        now = _now_iso()
+        for start in range(0, n, NEO4J_NODE_BATCH):
+            end = min(start + NEO4J_NODE_BATCH, n)
+            rows = [
+                {
+                    "id": _chunk_id(i),
+                    "props": {
+                        "name": corpus.session_ids[i],
+                        "type": "DocumentChunk",
+                        "text": texts[i],
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                }
+                for i in range(start, end)
+            ]
+            await graph_engine.query(
+                "UNWIND $rows AS r MERGE (n:Node {id: r.id}) SET n += r.props",
+                {"rows": rows},
+            )
+            print(f"[{self.name}] nodes {end}/{n}", flush=True)
+
+    async def _copy_edges(self, graph_engine, canonical_edges):
+        # 无向规范边（min,max 去重）各写一条有向 :EDGE；query_graph 用无向模式
+        # -[:EDGE*1..2]- 双向遍历，语义与其他臂一致。端点已全量建好，MATCH 必命中；
+        # canonical 已唯一 + 库已 scoped 清空 → CREATE（免 MERGE 的存在性扫描，更快）。
+        total = canonical_edges.shape[0]
+        for start in range(0, total, NEO4J_EDGE_BATCH):
+            chunk = canonical_edges[start : start + NEO4J_EDGE_BATCH]
+            rows = [
+                {"src": _chunk_id(int(a)), "dst": _chunk_id(int(b))}
+                for a, b in chunk
+            ]
+            await graph_engine.query(
+                "UNWIND $rows AS r "
+                "MATCH (a:Node {id: r.src}) MATCH (b:Node {id: r.dst}) "
+                "CREATE (a)-[:EDGE]->(b)",
+                {"rows": rows},
+            )
+            print(
+                f"[{self.name}] edges {min(start + NEO4J_EDGE_BATCH, total)}/{total}",
+                flush=True,
+            )
+
+    # ---- 覆盖 query_graph：Cypher 与基类逐字一致，仅适配 neo4j 的 dict 行返回 ----
+    def query_graph(self, seed_session_id, max_nodes):
+        chunk_id = self._sid2chunk.get(seed_session_id)
+        if chunk_id is None:
+            return []
+
+        async def _q():
+            from cognee.infrastructure.databases.graph import get_graph_engine
+
+            graph_engine = await get_graph_engine()
+            return await graph_engine.query(
+                f"MATCH (n:Node)-[:EDGE*1..{GRAPH_DEPTH}]-(m:Node) "
+                "WHERE n.id = $sid WITH DISTINCT m RETURN m.id AS mid",
+                {"sid": chunk_id},
+            )
+
+        sids = [seed_session_id]   # 种子自身属邻域（与基类/get_neighborhood 语义对齐）
+        seen = {seed_session_id}
+        for row in self._run(_q()):
+            node_id = (
+                row["mid"] if isinstance(row, dict)
+                else (row[0] if isinstance(row, (list, tuple)) else row)
+            )
+            sid = self._chunk2sid.get(str(node_id))
+            if sid and sid not in seen:
+                seen.add(sid)
+                sids.append(sid)
+        return sids

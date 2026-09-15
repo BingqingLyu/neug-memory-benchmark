@@ -172,17 +172,42 @@ class GraphitiPerfAdapter(PerfAdapter):
         # （GT 已按 hop 独立截断），不得用单一全局 top-N 截断——本语料 2 跳
         # 邻域可达 ~25k 节点，截断会丢 hop2 GT。max_nodes 形参此处不适用。
         #
+        # driver 级 BFS 短路（契约 §4"短路该步并记录"），**两臂共用这一份实现**，
+        # 不在子类里各写一遍——目的是让两臂的投影口径逐字相同，杜绝漂移。
+        # 不走 node_search(bfs) 的两个理由：
+        #   1) 成本：bfs 分支序列化节点全部字段（每节点 ~10KB summary，最大
+        #      邻域 25k 节点单次 ~7 分钟、50 题合计 ~4 小时），而本类查询的口径
+        #      只需要 uuid 集合。
+        #   2) 对称性（更要紧）：上游 get_entity_node_return_query() 对 neo4j
+        #      后端返回 properties(n)——含 1024 维 name_embedding、单行 46.2 KB，
+        #      对 NEUG/KUZU 后端只返回 7 个显式字段且明确不含 embedding；且
+        #      node_bfs_search 的 neo4j 分支无 DISTINCT（路径展开实测 3.6–8.5×）、
+        #      NEUG 分支有 seen_uuids 逐条去重。即走 node_search 会让两臂的
+        #      引擎侧工作量差 52×，而这差值与"引擎快慢"无关，只会虚高 NeuG。
+        #      实测（同一 neo4j 实例、distinct_n=8680 的种子，≈ 50 题中位 8678.5）：
+        #      全字段无去重投影 14172 行 / 7145.9 ms / 504.23 µs 每行，
+        #      WITH DISTINCT n RETURN n.uuid 8680 行 / 103.1 ms / 11.88 µs 每行。
+        # 遍历语义与 node_search bfs 分支一致（RELATES_TO*1..2 + 同组约束 +
+        # 引擎侧去重），仅 RETURN uuid。可行性已逐项核实：两臂建边都是双向各写
+        # 一条（见两个子类的 _load_edges）⇒ 有向 *1..2 等价于无向；neo4j 6.2.0
+        # 的 execute_query 把 kwargs 并进 parameters（dict(parameters_ or {},
+        # **kwargs)），NeuGDriver.execute_query 同样收 **kwargs ⇒ 绑参形式两臂
+        # 逐字通用；实测高度数种子（distinct_n=24936）本 Cypher 与
+        # RETURN DISTINCT n.uuid 的结果集对称差为 0。
         cached = self._graph_cache.get(seed_session_id)
         if cached is not None:
             return cached
-        nodes, _ = self._node_search(
-            query="",
-            qvec=None,
-            methods=[NodeSearchMethod.bfs],
-            limit=10_000_000,
-            bfs_origin_node_uuids=[seed_session_id],
-        )
-        result = [n.uuid for n in nodes]
+        rows, _, _ = self._run(self._driver.execute_query(
+            "MATCH (origin:Entity)-[:RELATES_TO*1.." + str(BFS_MAX_DEPTH) + "]->(n:Entity) "
+            "WHERE origin.uuid IN $origins AND n.group_id = origin.group_id "
+            # 先按节点身份去重再投影 uuid 字符串（WITH DISTINCT n RETURN n.uuid）：
+            # 直接 RETURN DISTINCT n.uuid 会对展开路径多重集上的 uuid 字符串做 hash
+            # 去重；改写后 NeuG 实测 p50 6.55ms->3.43ms（1.9×），50 个真实种子结果集
+            # 逐一致（0 处不匹配）。neo4j 侧同改写 276.9ms->251.0ms（1.10×，近中性）。
+            "WITH DISTINCT n RETURN n.uuid AS uuid",
+            origins=[seed_session_id],
+        ))
+        result = [r["uuid"] for r in rows]
         self._graph_cache[seed_session_id] = result
         return result
 
@@ -219,31 +244,6 @@ class GraphitiPerfAdapter(PerfAdapter):
 
 class GraphitiNeuGPerfAdapter(GraphitiPerfAdapter):
     name = "graphiti-neug"
-
-    def query_graph(self, seed_session_id, max_nodes):
-        # NEUG 专属短路（契约 §4"短路该步并记录"条款，详见 NOTES.md）：
-        # node_search 的 bfs 分支会序列化节点全部字段（每节点 ~10KB summary，
-        # 最大邻域 25k 节点单次 ~7 分钟；50 查询合计 ~4 小时），而本类查询
-        # 的口径只需要 uuid 集合。故此处直接走 driver 级 BFS，遍历语义与
-        # node_search bfs 分支完全一致（RELATES_TO*1..2 + 同组约束 +
-        # 引擎侧去重），仅 RETURN uuid。Neo4j 臂无此瓶颈，走真实
-        # node_search 路径。
-        cached = self._graph_cache.get(seed_session_id)
-        if cached is not None:
-            return cached
-        rows, _, _ = self._run(self._driver.execute_query(
-            "MATCH (origin:Entity)-[:RELATES_TO*1.." + str(BFS_MAX_DEPTH) + "]->(n:Entity) "
-            "WHERE origin.uuid IN $origins AND n.group_id = origin.group_id "
-            # 先按节点身份去重再投影 uuid 字符串（WITH DISTINCT n RETURN n.uuid）：
-            # 直接 RETURN DISTINCT n.uuid 会对展开路径多重集上的 uuid 字符串做 hash
-            # 去重；改写后 NeuG 实测 p50 6.55ms->3.43ms（1.9×），50 个真实种子结果集
-            # 逐一致（0 处不匹配）。
-            "WITH DISTINCT n RETURN n.uuid AS uuid",
-            origins=[seed_session_id],
-        ))
-        result = [r["uuid"] for r in rows]
-        self._graph_cache[seed_session_id] = result
-        return result
 
     def _db_dir(self, work_dir):
         return os.path.join(work_dir, "graphiti.db")
@@ -329,20 +329,29 @@ class GraphitiNeo4jPerfAdapter(GraphitiPerfAdapter):
             user=os.environ.get("NEO4J_USER", "neo4j"),
             password=os.environ.get("NEO4J_PASSWORD", "testpass"),
         )
-        # 性能赛道要求每次 load 从空库开始：清掉共享服务端图库
-        # （原内容为 LoCoMo 赛道 graphiti-neo4j 臂的图，可经 LLM 缓存再生）。
+        # 性能赛道要求每次 load 从空库开始：清掉**本臂**语料（group_id='perf'）。
+        # ⚠️ 必须 scope 到 group_id：这是共享服务端，同一实例里还住着 semantica
+        # LoCoMo neo4j 臂的 :SemanticaBench/:chunk 图（~1034 + ~962 点）与
+        # cognee-neo4j 臂的 :Node 图；无 scope 的 `MATCH (n) DELETE n` 会把它们
+        # 一并删掉，直接摧毁其它臂已落盘结果所依赖的图。与本仓另两处清理同一
+        # 手法：locomo 侧 `_clear_foreign_data`（只删 group_id='perf'）、perf 侧
+        # `SemanticaNeo4jPerfAdapter._clear`（只删 :SemanticaPerf）。
         # 分批删除：单事务全删会在 5.6M 边上撑爆事务内存池（8.4GB 上限）；
         # DETACH DELETE 连 hub 节点（度 ~25k）时单批边数仍会爆，故先按批
         # 删边、再删孤立点。
         while True:
             rows, _, _ = await driver.execute_query(
-                "MATCH ()-[r]->() WITH r LIMIT 100000 DELETE r RETURN count(*) AS c"
+                "MATCH ()-[r {group_id: $gid}]->() "
+                "WITH r LIMIT 100000 DELETE r RETURN count(*) AS c",
+                gid=GROUP_ID,
             )
             if not rows or int(rows[0]["c"]) == 0:
                 break
         while True:
             rows, _, _ = await driver.execute_query(
-                "MATCH (n) WITH n LIMIT 50000 DELETE n RETURN count(*) AS c"
+                "MATCH (n {group_id: $gid}) "
+                "WITH n LIMIT 50000 DELETE n RETURN count(*) AS c",
+                gid=GROUP_ID,
             )
             if not rows or int(rows[0]["c"]) == 0:
                 break

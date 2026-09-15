@@ -3,15 +3,18 @@
 HANDOFF-semantica-benchmark.md（§2 质量赛道）：
 - 接原生抽取管线：GraphBuilder.build（spacy NER + pattern 三元组，零 LLM），
   抽取产物按 (system, sample_id) 键控落 cache_dir，两配置共享同一份产物。
-- semantica-neug：NeuG 单库承载三路检索——HNSW 向量 + bm25 全文 + 图遍历，
-  融合用 Semantica 原生 ContextRetriever._rank_and_merge。
+- semantica-neug：NeuG 单库承载三路检索——HNSW 向量 + bm25 全文 + 图遍历。
+  向量与 bm25 经原生 VectorStore(backend=neug) 门面由后端 §1.4 内聚融合，图路经
+  GraphStore(backend=neug).get_neighbors；两门面经 §1.2 注册表共享单 engine。跨池
+  （向量+bm25 融合池 / 图池）合并仍用原生 ContextRetriever._rank_and_merge。
 - semantica-native：内存 ContextGraph + 原生 FAISS vector store，检索是
   向量+图两路；不接全文路（原生栈无全文，见 HANDOFF §1 源码事实），也不写
   客户端关键词兜底（决策 B3）。
-- 两臂都自拼各路命中、再裸调 ContextRetriever._rank_and_merge，不走
-  retrieve()：retrieve() 尾部的语义重排以 self.vector_store 为开关，会对每个
-  结果再 embed 一次 content[:500]，而 neug 臂的数据在后端、拿不到原生
-  vector_store，两臂必须同构（约束 5「后端切换唯一变量」）。
+- 两臂都裸调 ContextRetriever._rank_and_merge 当纯融合函数、不走 retrieve()：
+  retrieve() 尾部的语义重排以 self.vector_store 为开关，会对每个结果再 embed 一次
+  content[:500]（缓存键是截断串、必 miss），实测每题多次真实 API 调用计入检索延时；
+  两臂必须同构（约束 5「后端切换唯一变量」），故都不接 vector_store。neug 臂的
+  向量+bm25 融合在后端 §1.4 完成，不经这条尾部重排。
 - native 臂的向量分不能用 FAISS 返回的 "score" 字段：它对 inner_product 是
   余弦的严格递减函数，直接喂进融合器会把排序反转（见 _faiss_ip_score）。
 - 图路必须全路常量分，不要按种子排名衰减：get_neighbors 不返回相关度，
@@ -19,8 +22,9 @@ HANDOFF-semantica-benchmark.md（§2 质量赛道）：
 - native 臂的边必须双向各写一次：ContextGraph 的邻接只按 source 存、
   get_neighbors 只走出边，单向写入等于只看得到出边，而 neug 臂的
   GraphStore.get_neighbors 默认 direction="both"（实测差异见 _flush）。
-- neug 臂 reuse 冻结库前要过 _assert_vector_leg：跨仓 schema 迁移会让向量路
-  静默返回空、三路塌缩成纯 bm25，而 run 看上去是成功的（见该方法 docstring）。
+- neug 臂 reuse 冻结库前要过 _assert_vector_leg（走原生 vs.count()）：跨仓
+  schema 迁移会让向量路静默返回空、三路塌缩成纯 bm25，而 run 看上去是成功的
+  （见该方法 docstring）。
 - 唯一变量是后端：抽取产物、embedding（text-embedding-v3 内容哈希缓存）、
   hybrid_alpha、top_k、切块策略、图路打分与遍历方向、融合器、_to_hits
   两配置完全一致。
@@ -46,7 +50,7 @@ from openai import OpenAI
 from ..base import SearchHit, SearchTrace, SystemAdapter
 from ..llm import DEFAULT_BASE_URL
 
-# semantica / semantica_patch 经 benchmark venv 的 editable 安装提供，
+# semantica（含 graph_store/neug provider）经 benchmark venv 的 editable 安装提供，
 # 与 graphiti/mem0/cognee 三系统同惯例（裸导入，无 sys.path 注入）。
 
 EMBED_MODEL = os.environ.get("BENCH_EMBED_MODEL", "text-embedding-v3")
@@ -444,7 +448,8 @@ class SemanticaNeuGAdapter(_SemanticaBase):
 
     def __init__(self):
         super().__init__()
-        # sample_id -> {"gs": GraphStore, "vec": NeugVectorStore, "fts": NeugFTS}
+        # sample_id -> {"gs": GraphStore(neug), "vs": VectorStore(neug)}；两门面经
+        # §1.2 注册表共享单 engine，向量+bm25 由后端 §1.4 融合。
         self._stores: dict[str, dict] = {}
         self._prev_head: dict[str, str] = {}
         self._retriever = None
@@ -455,8 +460,11 @@ class SemanticaNeuGAdapter(_SemanticaBase):
         self._retriever = ContextRetriever(hybrid_alpha=HYBRID_ALPHA)
 
     def teardown(self):
-        # 引擎多实例坑：仅在此统一关闭，关闭后不再有任何查询。
+        # 引擎多实例坑：仅在此统一关闭，关闭后不再有任何查询。gs 与 vs 共享单
+        # engine（§1.2 注册表 refcount==2），两个都 close 才把 refcount 归 0、
+        # 真正释放引擎一次。
         for st in self._stores.values():
+            st["vs"].close()
             st["gs"].close()
         self._stores.clear()
 
@@ -471,12 +479,12 @@ class SemanticaNeuGAdapter(_SemanticaBase):
         """复用冻结库前校验向量路活着，否则整个 run 会静默退化成纯 bm25。
 
         run_eval 的复用闸门只比对 session 数（`.ingest_complete` 里就一个
-        `{"sessions": N}`），不带存储 schema 指纹。而 semantica_patch 迁移过
-        DDL：新增 `has_vec BOOL DEFAULT false`，`NeugVectorStore.search` 用它
-        做 HNSW 预过滤。旧库在 connect 时被 `ALTER TABLE ADD IF NOT EXISTS`
-        补上了列，但存量行全是默认 false，于是 `WHERE n.has_vec` 匹配 0 行、
-        `search` 返回空列表——不抛异常，与「确实没召回」无法区分；图路也因
-        拿不到向量种子而一并死掉，三路塌缩成一路。
+        `{"sessions": N}`），不带存储 schema 指纹。而后端迁移过 DDL：新增
+        `has_vec BOOL DEFAULT false`，`NeugVectorStore.search` 用它做 HNSW
+        预过滤。旧库在 connect 时被 `ALTER TABLE ADD IF NOT EXISTS` 补上了列，
+        但存量行全是默认 false，于是 `WHERE n.has_vec` 匹配 0 行、`search`
+        返回空列表——不抛异常，与「确实没召回」无法区分；图路也因拿不到向量
+        种子而一并死掉，三路塌缩成一路。
 
         2026-09-09 的 neug 臂就是这样跑出一份纯 bm25 结果（accuracy 0.5929 /
         p50 0.52ms），10 个库 `has_vec=true` 的行数全为 0，与旧基线的差值被
@@ -484,22 +492,15 @@ class SemanticaNeuGAdapter(_SemanticaBase):
         抽取产物都在 `results/locomo/cache/semantica/` 下，0 次 API 调用）。
         与 `_resolve_store` 同理：宁可炸，不要静默出数。
         """
-        from semantica_patch import schema_map
-
-        # 走 execute_query 而不是 query：后者带一个 looks_like_cypher 启发式
-        # 分支，把自然语言串改投 bm25 over Entity.content。这里发的本来就是
-        # Cypher，不该把正确性押在启发式上。
-        rows = st["gs"]._store_backend.execute_query(
-            f"MATCH (n:{schema_map.NODE_TABLE}) "
-            f"WHERE n.{schema_map.HAS_VEC_COL} RETURN count(n) AS c;")["records"]
-        if not rows or int(rows[0]["c"]) == 0:
+        # vs.count() = NeugVectorStore.count() = WHERE has_vec=true 的行数，正是
+        # 向量路 HNSW 预过滤的谓词。走原生门面，不再伸手 _store_backend 发裸 Cypher。
+        if st["vs"].count() == 0:
             raise RuntimeError(
-                f"{self.name}: store for {sample_id!r} has no rows with "
-                f"{schema_map.HAS_VEC_COL}=true, so the vector leg (and the "
-                "graph leg seeded from it) would silently return nothing and "
-                "the run would measure bm25 only. The frozen store predates "
-                "the semantica_patch schema migration - delete "
-                f"{self._work_dir} and re-ingest.")
+                f"{self.name}: store for {sample_id!r} has no rows with an "
+                "embedding (vs.count()==0), so the vector leg (and the graph "
+                "leg seeded from it) would silently return nothing and the run "
+                "would measure bm25 only. The frozen store predates the has_vec "
+                f"schema migration - delete {self._work_dir} and re-ingest.")
 
     def _prev_head_for(self, sample_id):
         return self._prev_head.get(sample_id)
@@ -512,16 +513,17 @@ class SemanticaNeuGAdapter(_SemanticaBase):
         if st is not None:
             return st
         from semantica.graph_store.graph_store import GraphStore
-        from semantica_patch import NeugFTS, NeugVectorStore
+        from semantica.vector_store.vector_store import VectorStore
 
-        gs = GraphStore(
-            backend="neug",
-            db_path=str(self._work_dir / f"semantica_{sample_id}.db"),
-            vector_dim=EMBED_DIM,
-        )
+        db_path = str(self._work_dir / f"semantica_{sample_id}.db")
+        gs = GraphStore(backend="neug", db_path=db_path, vector_dim=EMBED_DIM)
         gs.connect()
-        store = gs._store_backend
-        st = {"gs": gs, "vec": NeugVectorStore(store=store), "fts": NeugFTS(store)}
+        # Option A：向量+bm25 走原生 VectorStore(backend=neug) 门面（§1.3 派发 →
+        # §1.4 后端内聚融合），不再手工拼 NeugVectorStore/NeugFTS。§1.2 注册表让
+        # gs 与 vs 共享同一个 engine（refcount==2），无需手工共享 store。
+        vs = VectorStore(backend="neug",
+                         config={"db_path": db_path, "dimension": EMBED_DIM})
+        st = {"gs": gs, "vs": vs}
         self._stores[sample_id] = st
         return st
 
@@ -538,7 +540,7 @@ class SemanticaNeuGAdapter(_SemanticaBase):
         if edge_rows:
             backend.copy_edges(edge_rows)
 
-    # ---- 检索：三路（向量 + bm25 + 图扩展）走原生融合 ----
+    # ---- 检索：向量+bm25（后端 §1.4 融合）+ 图扩展，跨池走原生 _rank_and_merge ----
     def search(self, question: str, top_k: int = 20, sample_id: str | None = None):
         st = self._resolve_store(sample_id, self._stores)
 
@@ -549,46 +551,39 @@ class SemanticaNeuGAdapter(_SemanticaBase):
         qvec = _norm_vec(self._embed([question])[0])
         results: list[RetrievedContext] = []
 
-        # 路 1：HNSW 向量
-        # content 一律直接下标取，不用 .get(..., "")：字段是 _build_rows 给每个
-        # 节点行都写了的（chunk / entity 两类都有），缺了就说明后端返回形状变
-        # 了。此时空串会被 _to_hits 当空 payload 滤掉，一路静默消失、run 照样
+        # 路 1+2：HNSW 向量 + bm25 全文，经原生 VectorStore 门面由后端 §1.4 内聚
+        # 融合——传 _neug_raw_query 触发 bm25 路，命中自带 metadata['retrieval_routes']
+        # 溯源（['vector'] / ['bm25'] / 两者=共识）。qvec 由本臂预算好（与 native 臂
+        # 同一 _embed，约束 5 对称），不在后端重复 embed。
+        # content 一律直接下标取，不用 .get(..., "")：向量命中来自 _metadata_from_row、
+        # bm25-only 命中来自 fts hit，后端给每个命中都写了 content，缺了就说明返回
+        # 形状变了。此时空串会被 _to_hits 当空 payload 滤掉、一路静默消失、run 照样
         # "成功"——正是 P0-4 的失败模式。宁可炸。
-        vec_hits = st["vec"].search(qvec, top_k=top_k)
+        vec_hits = st["vs"].search_vectors(qvec, k=top_k, _neug_raw_query=question)
         for h in vec_hits:
             results.append(RetrievedContext(
                 content=h["metadata"]["content"], score=h["score"],
-                source=f"vector:{h['id']}", metadata={"node_id": h["id"]},
+                source=f"vector:{h['id']}",
+                metadata={"node_id": h["id"],
+                          "retrieval_routes": h["metadata"].get("retrieval_routes")},
             ))
 
-        # 路 2：bm25 全文（relevance 已在 hit 列表内归一到 [0,1]）。
-        # 前缀选 "vector:"，但这不是「唯一选项」：_rank_and_merge 有 vector/
-        # graph/memory 三池（权重 ×0.5 / ×0.5+boost / ×0.3），bm25 折进 memory
-        # 池同样合法——只是那样 bm25 封顶 0.3、低于向量路，实测只改动 top-20
-        # 的 6%（近乎失活）。折进 vector 池，是让 bm25 与向量命中作为对等的
-        # chunk 相关性信号竞争、成为主导的词法路（neug 全文能力要展示的就是
-        # 这一点）。代价：与向量共享 min-max，bm25 的 [0,1] 定义量程、把向量
-        # 余弦压到 [0.357,0.442]、常量分的图路挤到 top-20 的 0.6%——所以
-        # LoCoMo 端到端数字里「三路」实为「向量+bm25」，图路名存实亡。两池
-        # 完整消融见 results/locomo/semantica-neug/NOTES.md。
-        fts_hits = st["fts"].search(question, limit=top_k)
-        for h in fts_hits:
-            results.append(RetrievedContext(
-                content=h["content"], score=h["relevance"],
-                source=f"vector:fts:{h['id']}", metadata={"node_id": h["id"]},
-            ))
-
-        # 路 3：图扩展（与 native 臂共用 _graph_leg，全路常量分同参）
+        # 路 3：图扩展（与 native 臂共用 _graph_leg，全路常量分同参；种子取自融合命中）
         results.extend(_graph_leg(
             lambda nid: ((n["id"], n["properties"]["content"])
                          for n in st["gs"].get_neighbors(nid, depth=1)),
             vec_hits))
 
-        # Semantica 原生融合：分路归一化 + hybrid_alpha 加权 + 去重
+        # Semantica 原生融合：把「向量+bm25 融合池」与「图池」分池归一化 +
+        # hybrid_alpha 加权 + 去重（bm25 已在后端折进向量池，这里不再单列一路）。
+        # 融合改变了向量池的分值量程，图路占比随之变化——两池实际配比记在
+        # results/locomo/semantica-neug/NOTES.md（p2-3 重跑后更新）。
         merged = self._retriever._rank_and_merge(results, question)
         hits = _to_hits(merged, top_k)
         trace = SearchTrace(extra={
-            "vector_hits": len(vec_hits), "fts_hits": len(fts_hits),
+            "vector_hits": len(vec_hits),
+            "bm25_fused": sum(1 for h in vec_hits
+                              if "bm25" in (h["metadata"].get("retrieval_routes") or [])),
             "graph_hits": sum(1 for r in results if r.source.startswith("graph:")),
             "merged": len(merged),
         })
@@ -724,5 +719,217 @@ class SemanticaNativeAdapter(_SemanticaBase):
             "graph_hits": sum(1 for r in results if r.source.startswith("graph:")),
             "merged": len(merged),
             "fts": "N/A (native stack has no full-text route)",
+        })
+        return hits, trace
+
+
+# ---- semantica-neo4j 臂（server 对照）----
+# 连接参数与 graphiti-neo4j 臂同源（同一本地实例 bolt://localhost:7687），
+# 环境变量可覆盖。
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "testpass")
+# 共享服务端上的隔离标记：本臂所有节点带此 label，setup 精确清理、绝不触碰
+# graphiti-neo4j 的数据（那边靠 group_id 过滤 + 自己的 label 集）。
+NEO4J_MARK = "SemanticaBench"
+
+
+class SemanticaNeo4jAdapter(_SemanticaBase):
+    """server 对照：原生 FAISS 向量 + 真实 neo4j 图服务端，向量 + 图两路（无全文）。
+
+    能力面与 native 臂完全一致（向量 + 图，无 bm25 全文路），唯一变量是图后端从
+    内存 ContextGraph 换成真实 neo4j server（bolt RPC）——回答 maintainer "为何不
+    与 Semantica 默认后端对比"：neug（嵌入式单引擎，且独有 bm25 路）对 neo4j
+    （默认 server 后端）在同能力面上的质量对比。
+
+    与 native 臂的差异都是 neo4j 后端本身的性质（非配置差，约束 5 的唯一变量仍是
+    "后端"）：
+    - 图 ingest 走 facade add_nodes/add_edges（neo4j 无 COPY）；每 sample 图规模
+      106-269 节点 / 268-1356 边，逐行往返可接受（质量赛道不计 ingest 延时）。
+    - 边**单写**：Neo4jStore.get_neighbors 默认 direction="both"（无向 varlen），
+      与 neug 臂同构；native 臂的双写只是 ContextGraph 出边单向存储的补偿。
+    - 图腿需 app-id→internal-id 桥接：Neo4jStore.get_neighbors 用
+      ``WHERE id(start)=$node_id``（neo4j 内部整数 id），而种子来自 FAISS（存的
+      是 app 字符串 id）。facade 只在 create_relationship 里做该映射、
+      get_neighbors 不做，故复用 facade 自己维护的 ``_app_node_id_map`` 桥接
+      （probe_neo4j_arm 10/10：直接传 app 字符串 id 返回空，桥接后逐跳正确）。
+    """
+    name = "semantica-neo4j"
+
+    def __init__(self):
+        super().__init__()
+        # sample_id -> {"gs": GraphStore(neo4j), "vs": VectorStore(faiss)}
+        self._stores: dict[str, dict] = {}
+        self._prev_head: dict[str, str] = {}
+        self._retriever = None
+        # sample_id -> 已建过 neo4j 节点的 app id 集合。neo4j 的 CREATE 不去重，
+        # 靠它跳过复现实体的重复建点，对齐 native(self.nodes[id] upsert)/neug(PK
+        # 去重)，见 _flush 注释。
+        self._seen_nodes: dict[str, set] = {}
+
+    def _new_graph_store(self):
+        from semantica.graph_store.graph_store import GraphStore
+        return GraphStore(backend="neo4j", uri=NEO4J_URI, user=NEO4J_USER,
+                          password=NEO4J_PASSWORD)
+
+    def setup(self, work_dir: str, cache_dir: str):
+        super().setup(work_dir, cache_dir)
+        from semantica.context.context_retriever import ContextRetriever
+        self._retriever = ContextRetriever(hybrid_alpha=HYBRID_ALPHA)
+        # 共享服务端 fresh start：分批精确清掉本臂 marker 数据（scope 到
+        # :SemanticaBench，绝不触碰 graphiti-neo4j 或其它臂的节点）。
+        gs = self._new_graph_store()
+        gs.connect()
+        try:
+            self._clear_marker(gs)
+        finally:
+            gs.close()
+        # marker 清空 <=> 图空 <=> 去重状态清零：三者同一不变量。setup 是 fresh
+        # start 点，必须同步重置，否则同实例二次 run 会把建点全跳过、图空召回零。
+        self._seen_nodes.clear()
+
+    @staticmethod
+    def _clear_marker(gs):
+        # 先分批删边、再删点：单事务 DETACH DELETE 在大图上会撑爆事务内存池
+        # （与 graphiti perf-neo4j 臂同一手法，但 scope 到本臂 marker）。
+        while True:
+            rows = gs.query(
+                f"MATCH (n:{NEO4J_MARK})-[r]-() WITH r LIMIT 100000 DELETE r "
+                "RETURN count(*) AS c")
+            if not rows or int(rows[0]["c"]) == 0:
+                break
+        while True:
+            rows = gs.query(
+                f"MATCH (n:{NEO4J_MARK}) WITH n LIMIT 50000 DELETE n "
+                "RETURN count(*) AS c")
+            if not rows or int(rows[0]["c"]) == 0:
+                break
+
+    def teardown(self):
+        # 关掉每个 sample 的 bolt 连接；数据留在服务端（下次 setup 会清）。
+        for st in self._stores.values():
+            st["gs"].close()
+        self._stores.clear()
+
+    def reuse_ingested(self, sessions):
+        # setup 已清库：与 native 臂同法，从共享缓存（抽取产物 + 嵌入）零 API 重建。
+        for s in sessions:
+            if (s["sample_id"], s["session_idx"]) not in self._ingested:
+                self.ingest_session(s["sample_id"], s["session_idx"],
+                                    s.get("date_time", ""), s["text"])
+
+    def _prev_head_for(self, sample_id):
+        return self._prev_head.get(sample_id)
+
+    def _set_prev_head(self, sample_id, head):
+        self._prev_head[sample_id] = head
+
+    def _ensure_store(self, sample_id: str) -> dict:
+        st = self._stores.get(sample_id)
+        if st is not None:
+            return st
+        from semantica.vector_store.vector_store import VectorStore
+
+        gs = self._new_graph_store()
+        gs.connect()
+        vs = VectorStore(backend="faiss", config={"dimension": EMBED_DIM})
+        st = {"gs": gs, "vs": vs}
+        self._stores[sample_id] = st
+        return st
+
+    def _flush(self, sample_id, node_rows, edge_rows):
+        st = self._ensure_store(sample_id)
+        gs, vs = st["gs"], st["vs"]
+        # 图：facade add_nodes（labels 带 marker 供精确清理）；app 字符串 id 存进
+        # properties["id"]、内容存 properties["content"]，_app_node_id_map 记录
+        # app→internal（add_edges 的端点解析与图腿桥接都靠它）。
+        #
+        # 节点去重（对齐 native/neug，约束 5）：native 的 add_nodes 按 id upsert、
+        # neug 的 copy_nodes 按 PK 去重，同一 app id 恒一个节点、跨 session 的边全
+        # 累积到它上面。neo4j 的 CREATE 不去重，复现实体（ent:{sample}:{name}）逐
+        # session 会建多个节点，_app_node_id_map 覆盖成最后一个、早先 session 的边
+        # 挂在孤立节点上图腿走不到 -> 召回系统性偏少。故按已见 app id 跳过重复建点：
+        # 每 id 只 CREATE 一次，map 稳定指向它，后续 session 的边经 add_edges 端点
+        # 映射自然累积到同一节点，与 native/neug 拓扑逐位一致。
+        #
+        # 边不去重：Neo4jStore.get_neighbors 用 `RETURN DISTINCT id(neighbor),
+        # neighbor`、native get_neighbors 用 visited 集合，两边都把平行关系（复现
+        # 三元组）折叠成单个邻居，重复边对图腿输出无可观测影响。
+        seen_nodes = self._seen_nodes.setdefault(sample_id, set())
+        new_rows = []
+        for r in node_rows:
+            if r["id"] not in seen_nodes:
+                seen_nodes.add(r["id"])
+                new_rows.append(r)
+        if new_rows:
+            gs.add_nodes([
+                {"id": r["id"], "type": r["etype"], "content": r["content"],
+                 "labels": [str(r["etype"]), NEO4J_MARK]}
+                for r in new_rows
+            ])
+        if edge_rows:
+            # 单写：Neo4jStore.get_neighbors direction="both" 天然无向（同 neug 臂），
+            # 不需 native 臂那样的双向补偿。
+            gs.add_edges([
+                {"source_id": e["from_id"], "target_id": e["to_id"],
+                 "type": e["edge_type"], "weight": e["weight"]}
+                for e in edge_rows
+            ])
+        # 向量：与 native 臂逐位相同的 FAISS 路（flat + inner_product，归一向量上
+        # 等价余弦）；metadata 带 content/node_id 供检索直接下标。
+        # 故意**不**去重：native 臂每 session 也把全部 node_rows（含复现实体）塞进
+        # 同一 VectorStore(backend=faiss)，重复 id 由下游 _rank_and_merge(content
+        # [:100]) 与 _to_hits(node_id) 收敛。两臂走同一份 add_vectors、去重行为逐位
+        # 一致；此处擅自去重反会制造与 native 的差异（约束 5）。
+        vecs = np.asarray([r["vec"] for r in node_rows], dtype=np.float32)
+        backend_store = vs._backend_store
+        if backend_store.index is None:
+            backend_store.create_index(index_type="flat", metric="inner_product")
+        backend_store.add_vectors(
+            vecs, ids=[r["id"] for r in node_rows],
+            metadata=[{"content": r["content"], "node_id": r["id"]}
+                      for r in node_rows])
+
+    # ---- 检索：FAISS 向量 + neo4j 图两路，跨池走原生 _rank_and_merge（同 native）----
+    def search(self, question: str, top_k: int = 20, sample_id: str | None = None):
+        st = self._resolve_store(sample_id, self._stores)
+
+        from semantica.context.context_retriever import RetrievedContext
+
+        qvec = np.asarray(_norm_vec(self._embed([question])[0]),
+                          dtype=np.float32)
+        results: list[RetrievedContext] = []
+
+        # 路 1：FAISS（与 native 臂同一实现，无 bm25 融合——这正是与 neug 臂的能力差）
+        vec_hits = st["vs"].search_vectors(qvec, k=top_k)
+        for h in vec_hits:
+            results.append(RetrievedContext(
+                content=h["metadata"]["content"],
+                score=_faiss_ip_score(h),
+                source=f"vector:{h['id']}", metadata={"node_id": h["id"]},
+            ))
+
+        # 路 2：neo4j 图扩展（与 native/neug 共用 _graph_leg，全路常量分同参）。
+        # neighbors_of 做 app-id→internal-id 桥接：种子是 FAISS 存的 app 字符串 id，
+        # Neo4jStore.get_neighbors 要内部整数 id；回来再把 properties["id"]/content
+        # 映射成 (app_id, content) 交给 _graph_leg（与 neug 臂的 (id, content) 同形）。
+        gs = st["gs"]
+        idmap = gs._app_node_id_map
+
+        def neighbors_of(app_id):
+            internal = idmap.get(app_id, app_id)
+            for n in gs.get_neighbors(internal, depth=1):
+                props = n.get("properties", {}) or {}
+                yield (props.get("id", n.get("id")), props.get("content", ""))
+
+        results.extend(_graph_leg(neighbors_of, vec_hits))
+
+        merged = self._retriever._rank_and_merge(results, question)
+        hits = _to_hits(merged, top_k)
+        trace = SearchTrace(extra={
+            "vector_hits": len(vec_hits),
+            "graph_hits": sum(1 for r in results if r.source.startswith("graph:")),
+            "merged": len(merged),
+            "fts": "N/A (neo4j arm: FAISS vector + neo4j graph, no full-text route)",
         })
         return hits, trace

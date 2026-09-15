@@ -129,6 +129,7 @@ class Mem0PerfAdapter(PerfAdapter):
     def load(self, corpus):
         store = self.memory.vector_store
         n = len(corpus.session_ids)
+        lem = getattr(corpus, "text_lemmatized", None)
         for start in range(0, n, self.insert_batch):
             end = min(start + self.insert_batch, n)
             ids, payloads = [], []
@@ -139,12 +140,22 @@ class Mem0PerfAdapter(PerfAdapter):
                 ids.append(mid)
                 self._id2sid[mid] = corpus.session_ids[i]
                 self._sid2mid[corpus.session_ids[i]] = mid
-                payloads.append({
-                    # data 原文即 FTS 索引字段（NeuG text 列 / qdrant bm25 稀疏向量）
+                payload = {
+                    # data 原文（向量/图之外的原始文本载荷）
                     "data": corpus.texts[i],
                     "user_id": USER_ID,
                     "session_id": corpus.session_ids[i],
-                })
+                }
+                # mem0 core add() 对所有 backend 都存 text_lemmatized（main.py:1031），fts
+                # 的 doc 侧本应 lemmatized。三臂统一写此字段：neug/qdrant 的 `text_lemmatized
+                # or data` fallback 会优先取它（doc 从 raw 变 lemmatized，还原真实口径），
+                # pgvector 无 fallback、本就只认它。优先用预计算缓存（移出 load 计时），
+                # 无缓存才现场 lemmatize 兜底。
+                if lem is not None and lem[i] is not None:
+                    payload["text_lemmatized"] = lem[i]
+                else:
+                    payload["text_lemmatized"] = self._lemmatized(corpus.texts[i])
+                payloads.append(payload)
             store.insert(vectors=[list(v) for v in corpus.embeddings[start:end]],
                          payloads=payloads, ids=ids)
             if (start // self.insert_batch) % 10 == 9 or end == n:
@@ -452,3 +463,108 @@ class Mem0QdrantServerPerfAdapter(Mem0QdrantPerfAdapter):
                       flush=True)
                 return
             time.sleep(poll_s)
+
+
+class Mem0PgvectorPerfAdapter(Mem0PerfAdapter):
+    """pgvector server 模式臂：连本机 docker postgres+pgvector（host/port），建 HNSW + GIN 索引。
+
+    与 mem0-qdrant-server 同为“生产级服务型后端”公平基线（都建了真索引），堵住“neug 只赢在
+    跟没建索引的 local 模式比”的质疑。关键机制：
+    - vector_topk：pgvector HNSW（vector_cosine_ops；create_col 时 CREATE INDEX 建空索引，
+      insert 逐行增量维护）；查询走 `vector <=> %s::vector ORDER BY distance LIMIT k`。
+    - fts_keyword：**第三套 fts 实现**——Postgres 原生全文检索 to_tsvector/plainto_tsquery/
+      ts_rank_cd + GIN 索引。语义是 plainto_tsquery 的 **AND**（区别于 neug FTS5 的 OR 展开、
+      qdrant fastembed 的 soft-OR 稀疏向量），且 'simple' 配置不再 stem/去停用词（doc 侧已由
+      text_lemmatized 预 lemmatize、query 侧 query_fts 亦 lemmatize，两侧口径一致）。
+    - **payload 必须带 text_lemmatized**：pgvector.keyword_search 直接查 payload->>'text_lemmatized'
+      （GIN 索引亦建于此表达式），**无 neug/qdrant 的 `or data` fallback**。直注绕过 mem0 core
+      add()（main.py:1031 才写 text_lemmatized），故本臂 load 显式补该字段，否则 fts recall=0；
+      这也让 doc 侧口径对齐 mem0 真实行为（core add 对所有 backend 都存 text_lemmatized）。
+    - 无图遍历 → graph_multihop 保持基类 N/A。
+    连接信息用 BENCH_PGVECTOR_{HOST,PORT,USER,PASSWORD,DB} 覆盖（默认 localhost:5432 mem0/mem0/mem0）。
+    """
+    name = "mem0-pgvector"
+
+    def _conn_params(self):
+        return {
+            "host": os.environ.get("BENCH_PGVECTOR_HOST", "localhost"),
+            "port": int(os.environ.get("BENCH_PGVECTOR_PORT", "5432")),
+            "user": os.environ.get("BENCH_PGVECTOR_USER", "mem0"),
+            "password": os.environ.get("BENCH_PGVECTOR_PASSWORD", "mem0"),
+            "dbname": os.environ.get("BENCH_PGVECTOR_DB", "mem0"),
+        }
+
+    def _conninfo(self):
+        p = self._conn_params()
+        return (f"postgresql://{p['user']}:{p['password']}@"
+                f"{p['host']}:{p['port']}/{p['dbname']}")
+
+    def _vector_store_config(self, work_dir):
+        p = self._conn_params()
+        return {"provider": "pgvector", "config": {
+            "collection_name": "mem0",
+            "dbname": p["dbname"],
+            "user": p["user"],
+            "password": p["password"],
+            "host": p["host"],
+            "port": p["port"],
+            "embedding_model_dims": EMBED_DIMS,
+            "diskann": False,
+            "hnsw": True,
+        }}
+
+    def _backend_dirs(self, work_dir):
+        # server 模式数据在容器里，无本地目录可清；history.db 仍由基类 setup 清理。
+        return []
+
+    def setup(self, work_dir):
+        # create_col 用 CREATE TABLE IF NOT EXISTS，遇已存在表跳过不重建 → 每次跑前先 drop，
+        # 保证从空库开始（幂等）。HNSW/GIN 索引随表一并 drop。
+        self._drop_table()
+        super().setup(work_dir)
+        # 预建 entity_store 的 mem0_entities 表：mem0 _compute_entity_boosts 用
+        # ThreadPoolExecutor(max_workers=4) 并发搜实体（main.py:1778）。PGVector.__init__ 不建表
+        # （_collection_ensured=False，pgvector.py:188），建表推迟到首次 search 的
+        # _ensure_collection→create_col（pgvector.py:216/350）；该守卫无锁、CREATE TABLE IF NOT
+        # EXISTS 检查-创建又非原子 → query 期 4 线程首次并发 search 各自 create_col 竞争，撞
+        # pg_type UniqueViolation（手动单线程 drop→create→re-create 全程不撞，坐实是并发竞争
+        # 而非 orphan type）。故 setup 单线程强制 _ensure_collection 建表 + 置位，query 期 4
+        # 线程直接跳过 create。直注模式 entity_store 无写入，entity boost 结构性为空。
+        try:
+            self.memory.entity_store._ensure_collection()
+            print(f"[{self.name}] entity_store pre-created (mem0_entities)", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[{self.name}] entity_store pre-create skipped: {e}", flush=True)
+
+    def _drop_table(self):
+        import psycopg
+        from psycopg import sql
+        try:
+            with psycopg.connect(self._conninfo(), autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    # mem0 entity_store 惰性建 mem0_entities 表（entity boost 通道），与
+                    # qdrant-server 臂同口径一并 drop：否则残留表会让下次 create_col 撞
+                    # pg_type UniqueViolation（冒烟实测 mem0_entities duplicate key）。
+                    for tbl in ("mem0", "mem0_entities"):
+                        cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(
+                            sql.Identifier(tbl)))
+            print(f"[{self.name}] dropped stale tables mem0/mem0_entities", flush=True)
+        except Exception as e:  # noqa: BLE001 - 表不存在/连接未就绪都容忍
+            print(f"[{self.name}] drop table skipped: {e}", flush=True)
+
+    def load(self, corpus):
+        # base load 已统一写 text_lemmatized（lemmatized-doc，三臂同口径，pgvector fts 唯一
+        # 索引列）；pgvector 额外在 insert 后 ANALYZE 刷新 planner 统计，免得查询计划沿用
+        # 空表统计而失真。HNSW/GIN 在 create_col 建好、随 insert 增量维护（实测 ~2ms/row，
+        # 全量 ~100s，与 qdrant-server 同量级），计入 load_seconds_bg（背景成本，非对比指标）。
+        super().load(corpus)
+        self._analyze(self.memory.vector_store)
+
+    def _analyze(self, store):
+        from psycopg import sql
+        try:
+            with store._get_cursor(commit=True) as cur:
+                cur.execute(sql.SQL("ANALYZE {}").format(store._col()))
+            print(f"[{self.name}] ANALYZE mem0 done", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[{self.name}] ANALYZE skipped: {e}", flush=True)

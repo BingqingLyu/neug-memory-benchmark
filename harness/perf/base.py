@@ -35,6 +35,11 @@ class PerfCorpus:
     texts: list                # 长度 n
     embeddings: np.ndarray     # (n, dim) float32，已 L2 归一
     graph_edges: np.ndarray    # (E, 2) int32 无向边表
+    #: mem0 fts doc 侧口径：core add() 对所有 backend 都存 lemmatized text（main.py:1031），
+    #: 故 fts 的 doc 本应 lemmatized。预计算缓存（precompute_lemmatized.py）按行序对齐
+    #: session_ids；None=未预计算，由 adapter 现场 lemmatize 兜底。三臂统一从此读，既还原
+    #: mem0 真实行为、又把这份 core 固定成本移出 benchmark 的 load 计时（与 embeddings 同理）。
+    text_lemmatized: list | None = None   # 长度 n 或 None
 
 
 class PerfAdapter(ABC):

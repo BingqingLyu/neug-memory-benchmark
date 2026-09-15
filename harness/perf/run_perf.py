@@ -59,10 +59,11 @@ def _load_adapters():
 
     def _mem0():
         from .adapters.mem0_arm import (Mem0NeuGPerfAdapter, Mem0QdrantPerfAdapter,
-                                        Mem0QdrantServerPerfAdapter)
+                                        Mem0QdrantServerPerfAdapter, Mem0PgvectorPerfAdapter)
         ADAPTERS.setdefault(Mem0NeuGPerfAdapter.name, Mem0NeuGPerfAdapter)
         ADAPTERS.setdefault(Mem0QdrantPerfAdapter.name, Mem0QdrantPerfAdapter)
         ADAPTERS.setdefault(Mem0QdrantServerPerfAdapter.name, Mem0QdrantServerPerfAdapter)
+        ADAPTERS.setdefault(Mem0PgvectorPerfAdapter.name, Mem0PgvectorPerfAdapter)
 
     def _graphiti():
         from .adapters.graphiti_arm import GraphitiNeuGPerfAdapter, GraphitiNeo4jPerfAdapter
@@ -70,14 +71,19 @@ def _load_adapters():
         ADAPTERS.setdefault(GraphitiNeo4jPerfAdapter.name, GraphitiNeo4jPerfAdapter)
 
     def _cognee():
-        from .adapters.cognee_arm import CogneeBuiltInPerfAdapter, CogneeNeuGPerfAdapter
+        from .adapters.cognee_arm import (CogneeBuiltInPerfAdapter,
+                                          CogneeNeo4jPerfAdapter, CogneeNeuGPerfAdapter)
         ADAPTERS.setdefault(CogneeNeuGPerfAdapter.name, CogneeNeuGPerfAdapter)
         ADAPTERS.setdefault(CogneeBuiltInPerfAdapter.name, CogneeBuiltInPerfAdapter)
+        ADAPTERS.setdefault(CogneeNeo4jPerfAdapter.name, CogneeNeo4jPerfAdapter)
 
     def _semantica():
-        from .adapters.semantica_arm import SemanticaNativePerfAdapter, SemanticaNeuGPerfAdapter
+        from .adapters.semantica_arm import (SemanticaNativePerfAdapter,
+                                             SemanticaNeo4jPerfAdapter,
+                                             SemanticaNeuGPerfAdapter)
         ADAPTERS.setdefault(SemanticaNeuGPerfAdapter.name, SemanticaNeuGPerfAdapter)
         ADAPTERS.setdefault(SemanticaNativePerfAdapter.name, SemanticaNativePerfAdapter)
+        ADAPTERS.setdefault(SemanticaNeo4jPerfAdapter.name, SemanticaNeo4jPerfAdapter)
 
     for fn in (_bruteforce, _mem0, _graphiti, _cognee, _semantica):
         _try(fn)
@@ -99,8 +105,23 @@ def load_corpus() -> PerfCorpus:
     embeddings = np.load(DATA / f"embed_{EMBED_MODEL}.npy")
     graph_edges = np.load(DATA / "graph_edges.npy")
     assert len(session_ids) == embeddings.shape[0], "session/向量行数不一致"
+    # text_lemmatized 缓存（precompute_lemmatized.py 预计算；mem0 core add 的固定成本，
+    # 三臂 fts doc 侧统一 lemmatized 以还原真实行为）。按 session_id 映射回行序；
+    # 文件缺失或有 session 未覆盖则回退 None（adapter 现场 lemmatize 兜底）。
+    text_lemmatized = None
+    lem_path = DATA / "text_lemmatized.jsonl"
+    if lem_path.exists():
+        lem_map = {}
+        with lem_path.open() as f:
+            for line in f:
+                r = json.loads(line)
+                lem_map[r["session_id"]] = r["text_lemmatized"]
+        cand = [lem_map.get(sid) for sid in session_ids]
+        if all(x is not None for x in cand):
+            text_lemmatized = cand
     return PerfCorpus(session_ids=session_ids, texts=texts,
-                      embeddings=embeddings, graph_edges=graph_edges)
+                      embeddings=embeddings, graph_edges=graph_edges,
+                      text_lemmatized=text_lemmatized)
 
 
 def load_queries() -> dict:

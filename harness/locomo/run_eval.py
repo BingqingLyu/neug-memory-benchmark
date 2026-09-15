@@ -60,9 +60,12 @@ def _load_adapters():
         ADAPTERS.setdefault("graphiti-neo4j", GraphitiNeo4jAdapter)
 
     def _mem0():
-        from .adapters.mem0_arm import Mem0NeuGAdapter, Mem0QdrantAdapter
+        from .adapters.mem0_arm import (Mem0NeuGAdapter, Mem0PgvectorAdapter,
+                                        Mem0QdrantAdapter, Mem0QdrantServerAdapter)
         ADAPTERS.setdefault(Mem0NeuGAdapter.name, Mem0NeuGAdapter)
         ADAPTERS.setdefault(Mem0QdrantAdapter.name, Mem0QdrantAdapter)
+        ADAPTERS.setdefault(Mem0QdrantServerAdapter.name, Mem0QdrantServerAdapter)
+        ADAPTERS.setdefault(Mem0PgvectorAdapter.name, Mem0PgvectorAdapter)
 
     def _cognee():
         from .adapters.cognee_arm import CogneeDefaultAdapter, CogneeNeuGAdapter
@@ -70,9 +73,12 @@ def _load_adapters():
         ADAPTERS.setdefault(CogneeDefaultAdapter.name, CogneeDefaultAdapter)
 
     def _semantica():
-        from .adapters.semantica import SemanticaNativeAdapter, SemanticaNeuGAdapter
+        from .adapters.semantica import (SemanticaNativeAdapter,
+                                         SemanticaNeo4jAdapter,
+                                         SemanticaNeuGAdapter)
         ADAPTERS.setdefault(SemanticaNeuGAdapter.name, SemanticaNeuGAdapter)
         ADAPTERS.setdefault(SemanticaNativeAdapter.name, SemanticaNativeAdapter)
+        ADAPTERS.setdefault(SemanticaNeo4jAdapter.name, SemanticaNeo4jAdapter)
 
     for fn in (_naive_rag, _graphiti, _mem0, _cognee, _semantica):
         _try(fn)

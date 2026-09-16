@@ -18,3 +18,9 @@ test.py
 # 本地运行产物：日志与 run 缓存（与 results/ 同类，不进版本库）
 logs/
 .cache/
+
+# 一次性探针与本地工作流脚本（含硬编码本地路径，非交付实现）
+harness/locomo/probe_*.py
+harness/locomo/dump_context.py
+scripts_freeze_*.sh
+scripts_reeval_*.sh

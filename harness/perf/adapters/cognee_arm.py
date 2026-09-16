@@ -653,8 +653,10 @@ class CogneeNeo4jPerfAdapter(CogneePerfAdapter):
     reviewer 常问"跟 neo4j 比呢？"。本臂补上这个数据点。
 
     关键实现约束（均为实测事实，见 results/perf/cognee-neo4j/NOTES.md）：
-    - neo4j 是纯图后端（无向量）→ 本臂只跑 GRAPH_MULTIHOP，vector/fts/hybrid 归 N/A
-      （supported_classes 裁剪）；load 亦跳过向量直注（graph-only）。
+    - cognee 只把 neo4j 用作 graph 后端（Neo4jAdapter 仅实现 GraphDBInterface，
+      vector_db_provider dispatch 不含 neo4j），未接入 neo4j 引擎本身的向量/全文索引
+      能力（neo4j 5.11+ 其实原生支持向量索引）→ 本臂只跑 GRAPH_MULTIHOP，
+      vector/fts/hybrid 归 N/A（supported_classes 裁剪）；load 亦跳过向量直注。
     - 本机 neo4j 是 Community 2026.07.1 单库、且被 graphiti/semantica 臂共享
       → load 前只 scoped 清 :Node/:EDGE（本臂命名空间，实测当前各为 0，无碰撞），
       绝不学 graphiti 臂全库 wipe（会误删其他臂的图）。
@@ -671,13 +673,13 @@ class CogneeNeo4jPerfAdapter(CogneePerfAdapter):
     """
 
     name = "cognee-neo4j"
-    #: neo4j 无向量能力，本臂只为图侧对比 → 只跑 graph_multihop
+    #: cognee 未把 neo4j 接入向量/全文角色（并非 neo4j 引擎不能做）→ 只对比图侧
     supported_classes = frozenset({GRAPH_MULTIHOP})
 
     def _provider_env(self, work_dir):
         return {
-            # neo4j 纯图；给向量后端一个隔离到 work_dir 的合法值（本臂不 load/查询向量，
-            # 仅为 unified/config 解析兜底）
+            # cognee 侧 neo4j 仅承担图角色；给向量后端一个隔离到 work_dir 的合法值
+            # （本臂不 load/查询向量，仅为 unified/config 解析兜底）
             "VECTOR_DB_PROVIDER": "lancedb",
             "VECTOR_DB_URL": os.path.join(work_dir, "cognee.lancedb"),
             # 连本机共享 neo4j server；凭据与 graphiti/semantica 的 neo4j 臂同源
